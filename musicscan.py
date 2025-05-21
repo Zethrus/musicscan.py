@@ -74,6 +74,65 @@ def save_fingerprint_cache(cache_file_path, cache_data):
     except IOError as e:
         logging.error(f"Could not save fingerprint cache to {cache_file_path}: {e}")
 
+def ensure_unique_quarantine_filename(quarantine_dir, original_filename):
+    """
+    Ensures the destination filename in the quarantine directory is unique.
+    If 'filename.ext' exists, it tries 'filename (1).ext', 'filename (2).ext', etc.
+    Returns the full unique destination path.
+    """
+    base, ext = os.path.splitext(original_filename)
+    counter = 1
+    # Sanitize base name slightly for the counter part, though os.path.join handles most things
+    # This is a basic approach for problematic characters if base itself is very strange.
+    # For simplicity, we assume 'base' is reasonable here.
+    
+    dest_filename = original_filename
+    full_dest_path = os.path.join(quarantine_dir, dest_filename)
+    
+    while os.path.exists(full_dest_path):
+        dest_filename = f"{base} ({counter}){ext}"
+        full_dest_path = os.path.join(quarantine_dir, dest_filename)
+        counter += 1
+    return full_dest_path
+
+def move_file_to_quarantine(source_filepath, quarantine_base_dir, dry_run=False):
+    """
+    Moves a file to the quarantine directory.
+    Ensures the quarantine directory exists and handles potential filename collisions.
+    Returns True if successful (or would be successful in dry_run), False otherwise.
+    """
+    if not os.path.exists(source_filepath):
+        logging.warning(f"Source file for quarantine not found (already moved or deleted?): {source_filepath}")
+        print(f"\tWARNING: Source file not found: {source_filepath}")
+        return False
+
+    original_filename = os.path.basename(source_filepath)
+    action_prefix_moving = "DRY RUN: Would move" if dry_run else "Moving"
+    
+    try:
+        if not dry_run:
+            os.makedirs(quarantine_base_dir, exist_ok=True)
+        else:
+            # In dry_run, we don't create the directory, but ensure_unique_quarantine_filename will still check
+            # against the live file system if the quarantine_base_dir happens to exist.
+            logging.info(f"DRY RUN: Would ensure quarantine directory exists: {quarantine_base_dir}")
+        
+        unique_dest_path = ensure_unique_quarantine_filename(quarantine_base_dir, original_filename)
+        
+        # This print now occurs within the calling function for better context
+        # print(f"\t{action_prefix_moving} '{source_filepath}' to '{unique_dest_path}'") 
+        logging.info(f"{action_prefix_moving} '{source_filepath}' to '{unique_dest_path}'")
+        
+        if not dry_run:
+            shutil.move(source_filepath, unique_dest_path)
+        return True
+        
+    except Exception as e:
+        error_msg = f"Error moving '{source_filepath}' to quarantine '{quarantine_base_dir}': {e}"
+        print(f"\tERROR: {error_msg}")
+        logging.error(error_msg)
+        return False
+
 # --- Audio Fingerprinting Function ---
 def get_audio_fingerprint(filepath):
     try:
@@ -87,28 +146,24 @@ def get_audio_fingerprint(filepath):
         logging.error(f"Unexpected error fingerprinting {filepath}: {e}")
         return None, None
 
-def prompt_to_remove_duplicates(duplicates, dry_run=False):
+def prompt_to_remove_duplicates(duplicates, quarantine_path, dry_run=False): # Added quarantine_path
     if not duplicates:
-        logging.info("No duplicates found to prompt for removal.")
-        # The main function usually prints a message like "No duplicates found" if the duplicates dict is empty,
-        # so no need to print to console here.
+        logging.info("No duplicates found to prompt for quarantining.")
         return
 
     print('\nThe following acoustically similar files (duplicates) were found and will be processed individually:')
-    logging.info("Presenting duplicates to user for individual removal decision.")
+    logging.info("Presenting duplicates to user for individual quarantine decision.")
     
-    files_removed_count = 0
-    processed_in_prompt_loop = 0 # To track if any files were actually presented in the loop
-    remove_all_mode = False      # Flag for 'yes to all' (a)
-    quit_mode = False            # Flag for 'quit' (q)
+    files_quarantined_count = 0 # Renamed
+    processed_in_prompt_loop = 0 
+    remove_all_mode = False      
+    quit_mode = False            
 
-    # Sort duplicate sets by the canonical file path for consistent processing order
-    # The canonical file is the key in the 'duplicates' dictionary
     sorted_duplicate_sets = sorted(duplicates.items())
 
     for canonical_file, dupe_list in sorted_duplicate_sets:
         if quit_mode:
-            break # Stop processing any more duplicate sets if user quit
+            break 
         
         print(f"\n--- Processing Duplicates for Canonical File ---")
         print(f"  Keeping (Canonical): {canonical_file}")
@@ -118,94 +173,68 @@ def prompt_to_remove_duplicates(duplicates, dry_run=False):
             logging.debug(f"  No duplicates listed for {canonical_file} in this set.")
             continue
 
-        print(f"  The following are considered duplicates of it:")
+        print(f"  The following are considered duplicates of it (to be quarantined):") # Updated text
         
-        for i, file_to_remove in enumerate(dupe_list):
-            if quit_mode: # Check again in inner loop if 'q' was hit for a previous file
+        for i, file_to_quarantine in enumerate(dupe_list): # Renamed file_to_remove
+            if quit_mode: 
                 break 
             
-            if not os.path.exists(file_to_remove):
-                logging.warning(f"Duplicate file {file_to_remove} (for canonical {canonical_file}) no longer exists. Skipping.")
-                print(f"\t- {file_to_remove} (INFO: File already removed or moved)")
+            if not os.path.exists(file_to_quarantine):
+                logging.warning(f"Duplicate file {file_to_quarantine} (for canonical {canonical_file}) no longer exists. Skipping.")
+                print(f"\t- {file_to_quarantine} (INFO: File already removed or moved)")
                 continue
 
             processed_in_prompt_loop += 1
-            should_remove_current_file = False
+            should_quarantine_current_file = False # Renamed
             
-            # Display context for the current duplicate file
             print(f"\n\tConsidering duplicate {i+1} of {len(dupe_list)} for '{os.path.basename(canonical_file)}':")
-            print(f"\t  File to potentially remove: {file_to_remove}")
+            print(f"\t  File to potentially quarantine: {file_to_quarantine}") # Updated text
 
             if remove_all_mode:
-                should_remove_current_file = True
-                # No specific print here for the action yet, action print below covers it.
-                logging.info(f"Auto-processing (due to 'yes to all') duplicate file: {file_to_remove}")
+                should_quarantine_current_file = True
+                logging.info(f"Auto-processing (due to 'yes to all') duplicate file for quarantine: {file_to_quarantine}")
             else:
-                user_response = input("\tRemove this duplicate file? (y/n/a/q - yes/no/yes to ALL subsequent/quit ALL subsequent): ").strip().lower()
+                # Updated prompt text
+                user_response = input("\tMove this duplicate file to quarantine? (y/n/a/q - yes/no/yes to ALL subsequent/quit ALL subsequent): ").strip().lower()
                 
                 if user_response == 'y':
-                    should_remove_current_file = True
-                    logging.info(f"User chose 'yes' for duplicate file: {file_to_remove}")
+                    should_quarantine_current_file = True
+                    logging.info(f"User chose 'yes' to quarantine duplicate file: {file_to_quarantine}")
                 elif user_response == 'a':
-                    should_remove_current_file = True
+                    should_quarantine_current_file = True
                     remove_all_mode = True
-                    logging.info(f"User chose 'yes to all'. Will remove current and all subsequent duplicate files, starting with: {file_to_remove}")
+                    logging.info(f"User chose 'yes to all' to quarantine. Will quarantine current and all subsequent duplicate files, starting with: {file_to_quarantine}")
                 elif user_response == 'q':
                     quit_mode = True
-                    logging.info("User chose 'quit'. Halting all duplicate file removal processing.")
-                    print("\tQuitting duplicate file removal.")
-                    # We break from the inner loop here; the outer loop will catch quit_mode to stop further sets.
+                    logging.info("User chose 'quit'. Halting all duplicate file quarantine processing.")
+                    print("\tQuitting duplicate file quarantine.")
                     break 
                 elif user_response == 'n':
-                    logging.info(f"User chose 'no' for duplicate file: {file_to_remove}")
-                    print(f"\tSkipped: {file_to_remove}")
+                    logging.info(f"User chose 'no' for quarantining duplicate file: {file_to_quarantine}")
+                    print(f"\tSkipped: {file_to_quarantine}")
                 else:
-                    print(f"\tInvalid input '{user_response}'. Skipped: {file_to_remove}")
-                    logging.warning(f"Invalid input '{user_response}' for duplicate file {file_to_remove}. Skipped.")
+                    print(f"\tInvalid input '{user_response}'. Skipped: {file_to_quarantine}")
+                    logging.warning(f"Invalid input '{user_response}' for duplicate file {file_to_quarantine}. Skipped.")
 
-            if should_remove_current_file:
-                action_prefix = "DRY RUN: Would remove" if dry_run else "Removing"
-                print(f"\t{action_prefix}: {file_to_remove}")
-                logging.info(f"{action_prefix} duplicate file: {file_to_remove}")
-                if not dry_run:
-                    try:
-                        os.remove(file_to_remove)
-                        files_removed_count += 1
-                    except OSError as e:
-                        error_msg = f"Error removing {file_to_remove}: {e}"
-                        print(f"\t{error_msg}")
-                        logging.error(error_msg)
-                elif dry_run: # Count simulated removals in dry run
-                    files_removed_count += 1
-        # After processing all files in a dupe_list for a canonical_file,
-        # if quit_mode is True, the outer loop will check it and break.
-    
-    # Summarize actions after processing all duplicate sets (or quitting)
-    if files_removed_count > 0:
-        action_verb = "simulated removing" if dry_run else "removed"
-        print(f"\nFinished duplicate processing. {action_verb.capitalize()} {files_removed_count} file(s).")
-        logging.info(f"Finished duplicate processing. {action_verb.capitalize()} {files_removed_count} file(s).")
+            if should_quarantine_current_file:
+                # Call the helper function to move the file
+                if move_file_to_quarantine(file_to_quarantine, quarantine_path, dry_run):
+                    files_quarantined_count += 1 
+        
+    # Summarize actions (updated text)
+    if files_quarantined_count > 0:
+        action_verb = "simulated moving to quarantine" if dry_run else "moved to quarantine"
+        print(f"\nFinished duplicate processing. {action_verb.capitalize()} {files_quarantined_count} file(s).")
+        logging.info(f"Finished duplicate processing. {action_verb.capitalize()} {files_quarantined_count} file(s).")
     elif processed_in_prompt_loop > 0 and not quit_mode:
-        # This means the user was prompted for at least one file but chose not to remove any
-        # (or any chosen had errors and weren't counted in files_removed_count).
-        print("\nFinished duplicate processing. No files were removed based on your choices.")
-        logging.info("Finished duplicate processing. No files were removed based on user choices (all 'n' or invalid responses).")
-    elif quit_mode:
-        # Message for quitting is already printed when 'q' is selected.
-        # If files_removed_count > 0 before quitting, that summary is also shown.
-        # This specific case is if quit happened AND no files were removed.
-        if files_removed_count == 0:
-             print("\nDuplicate file removal process was quit by user; no files were removed during this phase.")
-             logging.info("Duplicate file removal process was quit by user; no files were removed during this phase.")
-    elif not duplicates: 
-        # This case is handled at the very beginning of the function by returning early.
-        pass
-    else: 
-        # This means `duplicates` was not empty, but `processed_in_prompt_loop` remained 0.
-        # This could happen if all listed duplicates for all sets were already missing from the filesystem.
-        if processed_in_prompt_loop == 0:
-            print("\nFinished duplicate processing. No duplicate files were available for interaction (perhaps already removed or paths were invalid).")
-            logging.info("Finished duplicate processing. No duplicate files were available for interaction (e.g., all missing on disk).")
+        print("\nFinished duplicate processing. No files were moved to quarantine based on your choices.")
+        logging.info("Finished duplicate processing. No files moved to quarantine by user choice.")
+    elif quit_mode and files_quarantined_count == 0:
+         print("\nDuplicate file quarantine process was quit by user; no files were moved to quarantine during this phase.")
+         logging.info("Duplicate file quarantine process was quit by user; no files were moved to quarantine during this phase.")
+    elif processed_in_prompt_loop == 0 and duplicates: # Duplicates dict was not empty initially
+        print("\nFinished duplicate processing. No duplicate files were available for interaction (perhaps already removed or paths were invalid).")
+        logging.info("Finished duplicate processing. No duplicate files were available for interaction.")
 
 def rename_files_from_metadata(filepath, dry_run=False):
     try:
@@ -322,20 +351,21 @@ def main():
             "  - Identification of files with bitrates below a defined threshold.\n"
             "  - Optional renaming of files based on their 'Artist - Title' metadata.\n"
             "  - Caching of audio fingerprints in the scanned directory \n"
-            "    (in a file named '" + CACHE_FILENAME + "') to significantly speed up subsequent scans.\n\n"
+            "    (in a file named '" + CACHE_FILENAME + "') to significantly speed up subsequent scans.\n"
+            "  - Files marked for removal are moved to a quarantine directory.\n\n" # Updated description
             "A detailed log of operations is saved to 'musicscan.log' in the directory \n"
             "from which the script is run.\n\n"
             "Required Python libraries: mutagen, pyacoustid, tqdm."
         ),
         epilog=(
             "Usage Examples:\n"
-            "  1. Basic scan of a directory (will prompt for actions):\n"
+            "  1. Basic scan (files will be quarantined to 'Deletions' folder in music dir):\n"
             "     python musicscan.py \"/path/to/your/music\"\n\n"
-            "  2. Interactive prompt for directory, then perform a dry run:\n"
-            "     python musicscan.py --dry-run\n\n"
-            "  3. Scan, enable metadata renaming, limit to 2 worker threads, and skip low bitrate check:\n"
+            "  2. Dry run, specify a custom quarantine path:\n"
+            "     python musicscan.py \"/path/to/your/music\" --dry-run --quarantine-path \"/tmp/my_quarantine\"\n\n"
+            "  3. Scan, enable metadata renaming, limit to 2 worker threads, skip low bitrate check:\n"
             "     python musicscan.py \"/path/to/your/music\" --rename-metadata --max-workers 2 --skip-low-bitrate\n\n"
-            "  4. Force re-fingerprinting of all files (ignore cache) and skip duplicate removal prompts:\n"
+            "  4. Force re-fingerprinting of all files (ignore cache) and skip duplicate processing:\n" # Clarified skip
             "     python musicscan.py \"/path/to/your/music\" --force-re-fingerprint --skip-duplicates\n"
         ),
         formatter_class=argparse.RawTextHelpFormatter
@@ -355,29 +385,40 @@ def main():
     parser.add_argument(
         '--dry-run',
         action='store_true',
-        help='Perform a dry run. The script will analyze files and report what actions \n(e.g., deletions, renames) it would take, but will NOT make any actual \nchanges to your files. Highly recommended for first-time use or when \nunsure about settings.'
+        help='Perform a dry run. The script will analyze files and report what actions \n(e.g., quarantines, renames) it would take, but will NOT make any actual \nchanges to your files or create directories. Highly recommended for first-time use.' # Updated help
+    )
+    parser.add_argument(
+        '--quarantine-path', # NEW ARGUMENT
+        type=str,
+        default=None,
+        metavar='QUARANTINE_DIR_PATH',
+        help='Path to a directory where files marked for removal will be moved (quarantined). \n'
+             'If a file with the same name exists in the quarantine directory, a number \n'
+             'will be appended to the new file (e.g., song (1).mp3).\n'
+             'If this option is NOT specified, files will be moved to a default folder named \n'
+             '"Deletions" created in the root of the scanned music directory.'
     )
     parser.add_argument(
         '--skip-duplicates',
         action='store_true',
-        help='Skip the acoustic duplicate detection phase entirely. \nThis can save considerable time if you only intend to use other features \nlike bitrate checking or metadata renaming for this run.'
+        help='Skip the acoustic duplicate detection and quarantining phase entirely.' # Updated help
     )
     parser.add_argument(
         '--skip-low-bitrate',
         action='store_true',
-        help=f'Skip the low bitrate file detection and associated removal prompts. \nThe current bitrate threshold is set to {BITRATE_THRESHOLD/1000:.0f}kbps.'
+        help=f'Skip the low bitrate file detection and associated quarantining prompts. \nThe current bitrate threshold is set to {BITRATE_THRESHOLD/1000:.0f}kbps.' # Updated help
     )
     parser.add_argument(
         '--force-re-fingerprint',
         action='store_true',
-        help='Force re-fingerprinting of all audio files, ignoring any existing entries \nin the fingerprint cache (' + CACHE_FILENAME + '). The cache will then be \nrebuilt with fresh fingerprints. Use this if you suspect the cache \nis corrupted or if the fingerprinting algorithm/settings have changed.'
+        help='Force re-fingerprinting of all audio files, ignoring any existing entries \nin the fingerprint cache (' + CACHE_FILENAME + '). The cache will then be \nrebuilt with fresh fingerprints.'
     )
     parser.add_argument(
         '--max-workers',
         type=int,
         default=None,
         metavar='N',
-        help='Maximum number of worker threads for parallel tasks, primarily for \nCPU-intensive audio fingerprinting and I/O-bound bitrate checks. \nIf not specified, defaults to using half of the available CPU cores \n(with a minimum of 1 worker) to help maintain system responsiveness. \nExample: --max-workers 2'
+        help='Maximum number of worker threads for parallel tasks (e.g., fingerprinting). \nIf not specified, defaults to using half of the available CPU cores \n(minimum 1) to maintain system responsiveness. \nExample: --max-workers 2'
     )
     args = parser.parse_args()
 
@@ -387,11 +428,10 @@ def main():
 
     # Determine the number of worker threads
     num_workers_cli = args.max_workers
-    if num_workers_cli is not None:
-        if num_workers_cli <= 0:
-            print("Warning: --max-workers must be a positive integer. Using a conservative default instead.")
-            logging.warning(f"--max-workers input '{num_workers_cli}' was <= 0. Reverting to default calculation.")
-            num_workers_cli = None 
+    if num_workers_cli is not None and num_workers_cli <= 0:
+        print("Warning: --max-workers must be a positive integer. Using a conservative default instead.")
+        logging.warning(f"--max-workers input '{num_workers_cli}' was <= 0. Reverting to default calculation.")
+        num_workers_cli = None 
 
     if num_workers_cli is None:
         num_workers = max(1, os.cpu_count() // 2)
@@ -402,32 +442,35 @@ def main():
     
     print(f"Using up to {num_workers} worker threads for parallel tasks.")
 
-
     directory_to_scan = args.directory
     if not directory_to_scan:
         directory_to_scan = input('Enter directory path to scan: ')
     
-    directory_to_scan = os.path.abspath(directory_to_scan) # Use absolute path for consistency
+    directory_to_scan = os.path.abspath(directory_to_scan) 
 
     if not os.path.isdir(directory_to_scan):
         error_msg = f"Error: Directory '{directory_to_scan}' not found."
         print(error_msg)
         logging.critical(error_msg)
-        exit(1) # Exit if directory is invalid
-    
-    # Configure logging file path to be inside the scanned directory if possible,
-    # otherwise, it defaults to CWD due to initial basicConfig call.
-    # For simplicity, the initial basicConfig will create 'musicscan.log' in CWD.
-    # A more advanced setup would delay basicConfig or add a specific FileHandler.
-    # The help text mentions CWD for the log file for now.
+        exit(1)
     
     logging.info(f"Starting scan in directory: {directory_to_scan}")
-    print(f"Scanning for audio files in: {directory_to_scan} ...")
+
+    # Determine effective quarantine path
+    if args.quarantine_path:
+        effective_quarantine_path = os.path.abspath(args.quarantine_path)
+        print(f"Quarantine Active: Files marked for removal will be moved to custom path: {effective_quarantine_path}")
+        logging.info(f"Using custom quarantine path: {effective_quarantine_path}")
+    else:
+        effective_quarantine_path = os.path.join(directory_to_scan, "Deletions") # Default
+        print(f"Quarantine Active: Files marked for removal will be moved to default path: {effective_quarantine_path}")
+        logging.info(f"Using default quarantine path: {effective_quarantine_path}")
     
+    # --- Initial File Scan ---
+    print(f"Scanning for audio files in: {directory_to_scan} ...")
     audio_files = []
     for root, _, files_in_root in os.walk(directory_to_scan):
         for file_basename in files_in_root:
-            # Expanded list of common audio extensions
             if file_basename.lower().endswith(('.mp3', '.wav', '.flac', '.m4a', '.ogg', '.aac', '.opus', '.wma', '.aiff', '.ape')):
                 audio_files.append(os.path.join(root, file_basename))
 
@@ -435,14 +478,14 @@ def main():
         msg = 'No audio files found in the directory or its subfolders.'
         print(msg)
         logging.info(msg)
-        exit(0) # Exit if no audio files are found
+        exit(0)
 
     print(f"Found {len(audio_files)} audio files. Starting analysis...")
     logging.info(f"Found {len(audio_files)} audio files for analysis.")
 
     # --- Duplicate Detection (Acoustic Fingerprinting with Caching) ---
     duplicates = {}
-    can_fingerprint_system_ok = check_fpcalc_executable() # Ensure fpcalc is available
+    can_fingerprint_system_ok = check_fpcalc_executable()
 
     if args.skip_duplicates:
         print("\nSkipping duplicate detection as per --skip-duplicates flag.")
@@ -473,7 +516,6 @@ def main():
                 abs_filepath = os.path.abspath(filepath) 
                 file_mtime = os.path.getmtime(abs_filepath)
                 file_size = os.path.getsize(abs_filepath)
-                
                 cached_data = fp_cache_from_disk.get(abs_filepath)
                 
                 if cached_data and \
@@ -481,32 +523,23 @@ def main():
                    cached_data.get("size") == file_size and \
                    cached_data.get("fingerprint_hex") and \
                    cached_data.get("duration") is not None:
-                    
-                    logging.debug(f"Cache hit for {os.path.basename(abs_filepath)}")
                     fp_bytes = bytes.fromhex(cached_data["fingerprint_hex"])
                     duration = cached_data["duration"]
                     duration_key = round(duration)
                     fingerprint_map[(fp_bytes, duration_key)].append(abs_filepath)
                     current_run_valid_cache_entries[abs_filepath] = cached_data 
                 else:
-                    if cached_data: 
-                        logging.debug(f"Cache stale/incomplete for {os.path.basename(abs_filepath)}. Queued for re-fingerprinting.")
-                    else: 
-                        logging.debug(f"Cache miss for {os.path.basename(abs_filepath)}. Queued for fingerprinting.")
                     files_needing_fingerprinting.append({'path': abs_filepath, 'mtime': file_mtime, 'size': file_size})
             except OSError as e:
                 logging.warning(f"Could not stat file {filepath} for cache check: {e}")
 
         if files_needing_fingerprinting:
-            print(f"\n-- Generating {len(files_needing_fingerprinting)} new/updated audio fingerprints (using {num_workers} workers, this may take a while)...")
-            logging.info(f"Generating {len(files_needing_fingerprinting)} new/updated audio fingerprints using {num_workers} workers.")
-            
+            print(f"\n-- Generating {len(files_needing_fingerprinting)} new/updated audio fingerprints (using {num_workers} workers)...")
             with ThreadPoolExecutor(max_workers=num_workers) as executor:
                 future_to_fileinfo = {
                     executor.submit(get_audio_fingerprint, fileinfo['path']): fileinfo
                     for fileinfo in files_needing_fingerprinting
                 }
-                
                 for future in tqdm(future_to_fileinfo, desc="Fingerprinting files", total=len(future_to_fileinfo), unit="file", smoothing=0.1, bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}{postfix}]'):
                     fileinfo = future_to_fileinfo[future]
                     abs_filepath = fileinfo['path']
@@ -525,11 +558,9 @@ def main():
                         logging.error(f"Error processing fingerprint result for {abs_filepath}: {e}")
         elif not args.force_re_fingerprint: 
             print("\n-- No new files to fingerprint. All valid fingerprints loaded from cache.")
-            logging.info("No new files to fingerprint. All valid fingerprints loaded from cache.")
         
         save_fingerprint_cache(cache_file_path, current_run_valid_cache_entries)
 
-        logging.info("Fingerprint processing complete. Identifying duplicates from map.")
         print("\n-- Identifying duplicates from fingerprints...")
         for (fp_bytes, duration_group), files_list in tqdm(fingerprint_map.items(), desc="Processing fingerprints", unit="group", smoothing=0.1, bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}{postfix}]'):
             if len(files_list) > 1:
@@ -538,26 +569,24 @@ def main():
                 duplicate_copies = files_list[1:]
                 if duplicate_copies:
                     duplicates[canonical_file] = duplicate_copies
-                    logging.debug(f"Duplicate set found: Key='{canonical_file}', Duplicates='{', '.join(duplicate_copies)}'")
 
         if duplicates:
-            prompt_to_remove_duplicates(duplicates, args.dry_run)
+            prompt_to_remove_duplicates(duplicates, effective_quarantine_path, args.dry_run) # Pass quarantine_path
         else:
             msg = 'No acoustically similar duplicate audio files found.'
             print(msg)
             logging.info(msg)
 
     # --- Low Bitrate File Check ---
-    # --- Low Bitrate File Check ---
     if args.skip_low_bitrate:
         print("\nSkipping low bitrate file check as per --skip-low-bitrate flag.")
         logging.info("Skipping low bitrate file check as per --skip-low-bitrate flag.")
     else:
-        response_check_low_br = input(f'\nWould you like to scan for files with bitrates lower than {BITRATE_THRESHOLD/1000:.0f}kbps? (y/n): ')
+        # Changed prompt from "delete" to "quarantine"
+        response_check_low_br = input(f'\nWould you like to scan for files with bitrates lower than {BITRATE_THRESHOLD/1000:.0f}kbps (to quarantine them)? (y/n): ')
         if response_check_low_br.lower() == 'y':
-            low_bitrate_files = [] # This list will store paths of low bitrate files
-            print(f"\n-- Checking for files with bitrates lower than {BITRATE_THRESHOLD/1000:.0f}kbps (using {num_workers} workers, this may take a while)...")
-            logging.info(f"Starting low bitrate file check (threshold: {BITRATE_THRESHOLD}bps) using {num_workers} workers.")
+            low_bitrate_files = []
+            print(f"\n-- Checking for files with bitrates lower than {BITRATE_THRESHOLD/1000:.0f}kbps (using {num_workers} workers)...")
             
             files_for_bitrate_check = [f for f in audio_files if os.path.exists(f)]
             with ThreadPoolExecutor(max_workers=num_workers) as executor:
@@ -568,134 +597,98 @@ def main():
                 for future in tqdm(future_to_file, desc=f"Checking bitrates (<{BITRATE_THRESHOLD/1000:.0f}kbps)", total=len(future_to_file), unit="file", smoothing=0.1, bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}{postfix}]'):
                     file_path = future_to_file[future]
                     try:
-                        if future.result(): # True if bitrate is low
+                        if future.result(): 
                              low_bitrate_files.append(file_path)
                     except Exception as exc:
                         logging.error(f'{os.path.basename(file_path)} generated an exception during bitrate check: {exc}')
             
             if low_bitrate_files:
                 print(f'\nFound {len(low_bitrate_files)} file(s) with bitrates lower than {BITRATE_THRESHOLD/1000:.0f}kbps.')
-                logging.info(f"Found {len(low_bitrate_files)} low bitrate files. Prompting for individual removal.")
+                logging.info(f"Found {len(low_bitrate_files)} low bitrate files. Prompting for individual quarantining.")
                 
-                removed_count = 0
-                processed_in_prompt_loop = 0 # To know if any files were presented to the user in the loop
-                remove_all_mode = False # Flag for 'yes to all' (a)
-                quit_mode = False       # Flag for 'quit' (q)
+                quarantined_count = 0 
+                processed_in_prompt_loop = 0
+                remove_all_mode = False 
+                quit_mode = False       
 
                 for i, file_path in enumerate(low_bitrate_files):
-                    if quit_mode:
-                        break 
-                    
+                    if quit_mode: break
                     if not os.path.exists(file_path):
-                        logging.warning(f"Low bitrate file {file_path} no longer exists (perhaps removed as duplicate). Skipping.")
+                        logging.warning(f"Low bitrate file {file_path} no longer exists. Skipping.")
                         continue
                     
                     processed_in_prompt_loop += 1
-                    should_remove_current_file = False
+                    should_quarantine_current_file = False
                     
-                    # Display which file is being considered
                     print(f"\n--- File {i+1} of {len(low_bitrate_files)} ---")
                     print(f"Low bitrate candidate: {file_path}")
 
                     if remove_all_mode:
-                        should_remove_current_file = True
-                        logging.info(f"Auto-processing (due to 'yes to all') low bitrate file: {file_path}")
-                        # No print here, action print happens if should_remove_current_file is true
+                        should_quarantine_current_file = True
+                        logging.info(f"Auto-processing (due to 'yes to all') low bitrate file for quarantine: {file_path}")
                     else:
-                        user_response = input("Remove this file? (y/n/a/q - yes/no/yes to ALL subsequent/quit ALL subsequent): ").strip().lower()
+                        user_response = input("Move this file to quarantine? (y/n/a/q): ").strip().lower()
                         
                         if user_response == 'y':
-                            should_remove_current_file = True
-                            logging.info(f"User chose 'yes' for low bitrate file: {file_path}")
+                            should_quarantine_current_file = True
+                            logging.info(f"User chose 'yes' to quarantine low bitrate file: {file_path}")
                         elif user_response == 'a':
-                            should_remove_current_file = True
+                            should_quarantine_current_file = True
                             remove_all_mode = True
-                            logging.info(f"User chose 'yes to all'. Will remove current and all subsequent low bitrate files: {file_path}")
+                            logging.info(f"User chose 'yes to all' to quarantine. Will quarantine current and all subsequent: {file_path}")
                         elif user_response == 'q':
                             quit_mode = True
-                            logging.info("User chose 'quit'. Halting low bitrate file removal process.")
-                            print("Quitting low bitrate file removal.")
+                            logging.info("User chose 'quit'. Halting low bitrate file quarantine process.")
+                            print("Quitting low bitrate file quarantine.")
                             break 
                         elif user_response == 'n':
-                            logging.info(f"User chose 'no' for low bitrate file: {file_path}")
+                            logging.info(f"User chose 'no' for quarantining low bitrate file: {file_path}")
                             print(f"Skipped: {file_path}")
                         else:
                             print(f"Invalid input '{user_response}'. Skipped: {file_path}")
                             logging.warning(f"Invalid input '{user_response}' for low bitrate file {file_path}. Skipped.")
 
-                    if should_remove_current_file:
-                        action_prefix = "DRY RUN: Would remove" if args.dry_run else "Removing"
-                        print(f"{action_prefix}: {file_path}")
-                        logging.info(f"{action_prefix} low bitrate file: {file_path}")
-                        if not args.dry_run:
-                            try:
-                                os.remove(file_path)
-                                removed_count += 1
-                            except OSError as e:
-                                error_msg = f"Error removing {file_path}: {e}"
-                                print(error_msg)
-                                logging.error(error_msg)
-                        elif args.dry_run: # Count simulated removals in dry run
-                            removed_count += 1
+                    if should_quarantine_current_file:
+                        # Use the move_file_to_quarantine helper
+                        if move_file_to_quarantine(file_path, effective_quarantine_path, args.dry_run):
+                            quarantined_count += 1
                 
-                # Summarize actions after the loop
-                if removed_count > 0:
-                    action_verb = "simulated removing" if args.dry_run else "removed"
-                    print(f"\nFinished low bitrate processing. {action_verb.capitalize()} {removed_count} file(s).")
-                    logging.info(f"Finished low bitrate processing. {action_verb.capitalize()} {removed_count} file(s).")
-                elif processed_in_prompt_loop > 0 and not quit_mode: 
-                    # This means user was prompted for at least one file but chose not to remove any (or any that were chosen had errors)
-                    # and didn't quit early.
-                    print("\nFinished low bitrate processing. No files were removed based on your choices.")
-                    logging.info("Finished low bitrate processing. No files were removed based on user choices (all 'n' or invalid responses).")
-                elif quit_mode:
-                    # Message for quitting is already printed. If removed_count > 0, that's covered.
-                    # If removed_count is 0 and quit_mode, means quit before any 'y' or 'a'.
-                    if removed_count == 0: # Ensure a message if quit before any action
-                         print("\nLow bitrate file removal process was quit by user; no files were removed during this phase.")
-                         logging.info("Low bitrate file removal process was quit by user; no files were removed during this phase.")
-                # If processed_in_prompt_loop is 0, it implies low_bitrate_files was populated but all files vanished before prompt loop.
-                # That case is covered by the os.path.exists check and the outer else.
-            
-            else: # No low_bitrate_files found after scan
-                msg = f'No files identified with bitrates lower than {BITRATE_THRESHOLD/1000:.0f}kbps (or they were already removed by other operations).'
+                if quarantined_count > 0:
+                    action_verb = "simulated moving to quarantine" if args.dry_run else "moved to quarantine"
+                    print(f"\nFinished low bitrate processing. {action_verb.capitalize()} {quarantined_count} file(s).")
+                elif processed_in_prompt_loop > 0 and not quit_mode:
+                    print("\nFinished low bitrate processing. No files were moved to quarantine based on your choices.")
+                elif quit_mode and quarantined_count == 0:
+                     print("\nLow bitrate file quarantine process was quit by user; no files were moved during this phase.")
+            else: 
+                msg = f'No files identified with bitrates lower than {BITRATE_THRESHOLD/1000:.0f}kbps (or were already handled).'
                 print(msg)
                 logging.info(msg)
-        else: # User chose not to scan for low bitrate files
+        else: 
             print('\nScan for low bitrate files skipped by user.')
             logging.info("User chose not to scan for low bitrate files.")
 
     # --- Rename files based on metadata (conditionally) ---
     if args.rename_metadata:
         print("\n-- Renaming files based on metadata --")
-        logging.info("Starting metadata-based renaming process.")
         files_to_rename_check = [f for f in audio_files if os.path.exists(f)]
-        
         if not files_to_rename_check:
-            msg = "No audio files found/remaining to consider for renaming."
-            print(msg)
-            logging.info(msg)
+            print("No audio files found/remaining to consider for renaming.")
         else:
-            print(f"Checking {len(files_to_rename_check)} audio file(s) for renaming (if metadata available)...")
+            print(f"Checking {len(files_to_rename_check)} audio file(s) for renaming...")
             renamed_count = 0
             for file_path in tqdm(files_to_rename_check, desc="Renaming files", unit="file", smoothing=0.1, bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}{postfix}]'):
                 if rename_files_from_metadata(file_path, args.dry_run):
                     renamed_count += 1
-            
             if renamed_count > 0:
-                summary_msg = f"Successfully {'simulated renaming of' if args.dry_run else 'renamed'} {renamed_count} file(s) based on metadata."
-                print(summary_msg)
-                logging.info(summary_msg)
-            elif args.dry_run and len(files_to_rename_check) > 0 : 
+                summary_action = "simulated renaming of" if args.dry_run else "renamed"
+                print(f"Successfully {summary_action} {renamed_count} file(s) based on metadata.")
+            elif args.dry_run and len(files_to_rename_check) > 0: 
                 print("Dry run: No files were actually renamed.")
-                logging.info("Dry run: No files were actually renamed.")
             else:
-                msg = "No files were renamed based on metadata (either already correctly named, no metadata, errors, or dry run)."
-                print(msg)
-                logging.info(msg)
+                print("No files were renamed based on metadata.")
     else:
-        print("\nSkipping renaming files based on metadata (use --rename-metadata to enable).")
-        logging.info("Renaming based on metadata disabled by command-line flag or default.")
+        print("\nSkipping renaming files based on metadata.")
 
     print('\nFinished scanning and processing.')
     logging.info("Script finished.")
@@ -706,5 +699,5 @@ if __name__ == "__main__":
     except ImportError:
         print("CRITICAL: Mutagen library is not installed. This script cannot run without it.")
         print("Please install it using: pip install mutagen")
-        exit(1) # Exit if mutagen cannot be imported
+        exit(1)
     main()

@@ -480,13 +480,14 @@ def main():
             logging.info(msg)
 
     # --- Low Bitrate File Check ---
+    # --- Low Bitrate File Check ---
     if args.skip_low_bitrate:
         print("\nSkipping low bitrate file check as per --skip-low-bitrate flag.")
         logging.info("Skipping low bitrate file check as per --skip-low-bitrate flag.")
     else:
         response_check_low_br = input(f'\nWould you like to scan for files with bitrates lower than {BITRATE_THRESHOLD/1000:.0f}kbps? (y/n): ')
         if response_check_low_br.lower() == 'y':
-            low_bitrate_files = []
+            low_bitrate_files = [] # This list will store paths of low bitrate files
             print(f"\n-- Checking for files with bitrates lower than {BITRATE_THRESHOLD/1000:.0f}kbps (using {num_workers} workers, this may take a while)...")
             logging.info(f"Starting low bitrate file check (threshold: {BITRATE_THRESHOLD}bps) using {num_workers} workers.")
             
@@ -499,48 +500,100 @@ def main():
                 for future in tqdm(future_to_file, desc=f"Checking bitrates (<{BITRATE_THRESHOLD/1000:.0f}kbps)", total=len(future_to_file), unit="file", smoothing=0.1, bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}{postfix}]'):
                     file_path = future_to_file[future]
                     try:
-                        if future.result(): 
+                        if future.result(): # True if bitrate is low
                              low_bitrate_files.append(file_path)
                     except Exception as exc:
                         logging.error(f'{os.path.basename(file_path)} generated an exception during bitrate check: {exc}')
             
             if low_bitrate_files:
-                print(f'\nThe following files have bitrates lower than {BITRATE_THRESHOLD/1000:.0f}kbps:')
-                logging.info(f"Found {len(low_bitrate_files)} low bitrate files:")
-                for file_path in low_bitrate_files:
-                    print(file_path)
-                    logging.info(f"\t- {file_path}")
-                response_delete_low = input('Would you like to delete these low bitrate files? (y/n): ')
-                if response_delete_low.lower() == 'y':
-                    removed_low_bitrate_count = 0
-                    action_prefix = "DRY RUN: Would remove" if args.dry_run else "Removing"
-                    for file_path in low_bitrate_files:
-                        if os.path.exists(file_path): 
+                print(f'\nFound {len(low_bitrate_files)} file(s) with bitrates lower than {BITRATE_THRESHOLD/1000:.0f}kbps.')
+                logging.info(f"Found {len(low_bitrate_files)} low bitrate files. Prompting for individual removal.")
+                
+                removed_count = 0
+                processed_in_prompt_loop = 0 # To know if any files were presented to the user in the loop
+                remove_all_mode = False # Flag for 'yes to all' (a)
+                quit_mode = False       # Flag for 'quit' (q)
+
+                for i, file_path in enumerate(low_bitrate_files):
+                    if quit_mode:
+                        break 
+                    
+                    if not os.path.exists(file_path):
+                        logging.warning(f"Low bitrate file {file_path} no longer exists (perhaps removed as duplicate). Skipping.")
+                        continue
+                    
+                    processed_in_prompt_loop += 1
+                    should_remove_current_file = False
+                    
+                    # Display which file is being considered
+                    print(f"\n--- File {i+1} of {len(low_bitrate_files)} ---")
+                    print(f"Low bitrate candidate: {file_path}")
+
+                    if remove_all_mode:
+                        should_remove_current_file = True
+                        logging.info(f"Auto-processing (due to 'yes to all') low bitrate file: {file_path}")
+                        # No print here, action print happens if should_remove_current_file is true
+                    else:
+                        user_response = input("Remove this file? (y/n/a/q - yes/no/yes to ALL subsequent/quit ALL subsequent): ").strip().lower()
+                        
+                        if user_response == 'y':
+                            should_remove_current_file = True
+                            logging.info(f"User chose 'yes' for low bitrate file: {file_path}")
+                        elif user_response == 'a':
+                            should_remove_current_file = True
+                            remove_all_mode = True
+                            logging.info(f"User chose 'yes to all'. Will remove current and all subsequent low bitrate files: {file_path}")
+                        elif user_response == 'q':
+                            quit_mode = True
+                            logging.info("User chose 'quit'. Halting low bitrate file removal process.")
+                            print("Quitting low bitrate file removal.")
+                            break 
+                        elif user_response == 'n':
+                            logging.info(f"User chose 'no' for low bitrate file: {file_path}")
+                            print(f"Skipped: {file_path}")
+                        else:
+                            print(f"Invalid input '{user_response}'. Skipped: {file_path}")
+                            logging.warning(f"Invalid input '{user_response}' for low bitrate file {file_path}. Skipped.")
+
+                    if should_remove_current_file:
+                        action_prefix = "DRY RUN: Would remove" if args.dry_run else "Removing"
+                        print(f"{action_prefix}: {file_path}")
+                        logging.info(f"{action_prefix} low bitrate file: {file_path}")
+                        if not args.dry_run:
                             try:
-                                print(f"{action_prefix} low bitrate file: {file_path}")
-                                logging.info(f"{action_prefix} low bitrate file: {file_path}")
-                                if not args.dry_run:
-                                    os.remove(file_path)
-                                removed_low_bitrate_count += 1
+                                os.remove(file_path)
+                                removed_count += 1
                             except OSError as e:
                                 error_msg = f"Error removing {file_path}: {e}"
                                 print(error_msg)
                                 logging.error(error_msg)
-                    if removed_low_bitrate_count > 0:
-                        summary_msg = f"Successfully {'simulated removal of' if args.dry_run else 'removed'} {removed_low_bitrate_count} low bitrate file(s)."
-                        print(summary_msg)
-                        logging.info(summary_msg)
-                    elif args.dry_run and len(low_bitrate_files) > 0: 
-                        print("Dry run: No low bitrate files were actually removed.")
-                        logging.info("Dry run: No low bitrate files were actually removed.")
-                else:
-                    print('Low bitrate files not removed.')
-                    logging.info("User chose not to remove low bitrate files.")
-            else:
-                msg = f'No files found with bitrates lower than {BITRATE_THRESHOLD/1000:.0f}kbps (or they were already removed).'
+                        elif args.dry_run: # Count simulated removals in dry run
+                            removed_count += 1
+                
+                # Summarize actions after the loop
+                if removed_count > 0:
+                    action_verb = "simulated removing" if args.dry_run else "removed"
+                    print(f"\nFinished low bitrate processing. {action_verb.capitalize()} {removed_count} file(s).")
+                    logging.info(f"Finished low bitrate processing. {action_verb.capitalize()} {removed_count} file(s).")
+                elif processed_in_prompt_loop > 0 and not quit_mode: 
+                    # This means user was prompted for at least one file but chose not to remove any (or any that were chosen had errors)
+                    # and didn't quit early.
+                    print("\nFinished low bitrate processing. No files were removed based on your choices.")
+                    logging.info("Finished low bitrate processing. No files were removed based on user choices (all 'n' or invalid responses).")
+                elif quit_mode:
+                    # Message for quitting is already printed. If removed_count > 0, that's covered.
+                    # If removed_count is 0 and quit_mode, means quit before any 'y' or 'a'.
+                    if removed_count == 0: # Ensure a message if quit before any action
+                         print("\nLow bitrate file removal process was quit by user; no files were removed during this phase.")
+                         logging.info("Low bitrate file removal process was quit by user; no files were removed during this phase.")
+                # If processed_in_prompt_loop is 0, it implies low_bitrate_files was populated but all files vanished before prompt loop.
+                # That case is covered by the os.path.exists check and the outer else.
+            
+            else: # No low_bitrate_files found after scan
+                msg = f'No files identified with bitrates lower than {BITRATE_THRESHOLD/1000:.0f}kbps (or they were already removed by other operations).'
                 print(msg)
                 logging.info(msg)
-        else:
+        else: # User chose not to scan for low bitrate files
             print('\nScan for low bitrate files skipped by user.')
             logging.info("User chose not to scan for low bitrate files.")
 

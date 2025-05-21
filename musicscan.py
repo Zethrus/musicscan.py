@@ -67,12 +67,27 @@ def load_fingerprint_cache(cache_file_path):
     return {}
 
 def save_fingerprint_cache(cache_file_path, cache_data):
+    temp_cache_file_path = cache_file_path + ".tmp" # Write to a temporary file first
     try:
-        with open(cache_file_path, 'w', encoding='utf-8') as f:
+        with open(temp_cache_file_path, 'w', encoding='utf-8') as f:
             json.dump(cache_data, f, indent=4)
+        # If writing to temp file is successful, atomically replace the old cache file
+        os.replace(temp_cache_file_path, cache_file_path) 
         logging.info(f"Fingerprint cache with {len(cache_data)} entries saved to {cache_file_path}")
-    except IOError as e:
+    except (IOError, json.JSONDecodeError) as e: # json.JSONDecodeError is for loading, but good to be broad for dump too
         logging.error(f"Could not save fingerprint cache to {cache_file_path}: {e}")
+        if os.path.exists(temp_cache_file_path):
+            try:
+                os.remove(temp_cache_file_path) # Clean up temp file on error
+            except OSError as e_rm:
+                logging.error(f"Could not remove temporary cache file {temp_cache_file_path}: {e_rm}")
+    except Exception as e: # Catch any other unexpected errors during save/replace
+        logging.error(f"Unexpected error saving fingerprint cache: {e}")
+        if os.path.exists(temp_cache_file_path):
+             try:
+                os.remove(temp_cache_file_path)
+             except OSError as e_rm:
+                logging.error(f"Could not remove temporary cache file {temp_cache_file_path}: {e_rm}")
 
 def ensure_unique_quarantine_filename(quarantine_dir, original_filename):
     """

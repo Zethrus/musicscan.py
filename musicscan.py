@@ -14,6 +14,7 @@ import time # For mtime
 BITRATE_THRESHOLD = 256000
 FINGERPRINT_AUDIO_MAX_LENGTH_SECONDS = 0 # 0 means process the whole file
 CACHE_FILENAME = ".musicscan_fp_cache.json"
+UNSORTED_PATH_MARKER_SEGMENTS = ("Music", "Unsorted") # Segments to identify an "unsorted" path
 
 # --- Logging Setup ---
 # Placed here so it's configured before any logging calls, even from functions
@@ -147,6 +148,35 @@ def move_file_to_quarantine(source_filepath, quarantine_base_dir, dry_run=False)
         print(f"\tERROR: {error_msg}")
         logging.error(error_msg)
         return False
+
+def is_in_target_path_pattern(filepath, pattern_segments):
+    """
+    Checks if a filepath string contains a specific sequence of directory name segments.
+    This check is case-insensitive and handles both / and \\ path separators.
+    Example: pattern_segments = ("Music", "Unsorted") will match /path/to/Music/Unsorted/song.mp3
+    """
+    if not filepath or not pattern_segments:
+        return False
+    try:
+        # Normalize the filepath: lower case and split into parts
+        # os.path.normcase might be better for direct case-insensitivity of the whole path for comparison
+        # but splitting and lowercasing parts is robust for segment matching.
+        normalized_filepath_parts = [part.lower() for part in os.path.normpath(filepath).split(os.sep) if part] # Ensure no empty parts from multiple slashes
+
+        # Normalize pattern segments
+        normalized_pattern_segments = [part.lower() for part in pattern_segments]
+        
+        pattern_len = len(normalized_pattern_segments)
+        if pattern_len == 0:
+            return False
+
+        for i in range(len(normalized_filepath_parts) - pattern_len + 1):
+            if normalized_filepath_parts[i:i+pattern_len] == normalized_pattern_segments:
+                return True
+        return False
+    except Exception as e:
+        logging.warning(f"Error checking path pattern for '{filepath}' with pattern '{pattern_segments}': {e}")
+        return False # Default to not matching if an error occurs during path processing
 
 # --- Audio Fingerprinting Function ---
 def get_audio_fingerprint(filepath):
@@ -460,8 +490,7 @@ def main():
     directory_to_scan = args.directory
     if not directory_to_scan:
         directory_to_scan = input('Enter directory path to scan: ')
-    
-    directory_to_scan = os.path.abspath(directory_to_scan) 
+    directory_to_scan = os.path.abspath(directory_to_scan)
 
     if not os.path.isdir(directory_to_scan):
         error_msg = f"Error: Directory '{directory_to_scan}' not found."
@@ -471,32 +500,64 @@ def main():
     
     logging.info(f"Starting scan in directory: {directory_to_scan}")
 
-    # Determine effective quarantine path
+    # Determine effective quarantine path (this logic should already be in your main())
     if args.quarantine_path:
         effective_quarantine_path = os.path.abspath(args.quarantine_path)
-        print(f"Quarantine Active: Files marked for removal will be moved to custom path: {effective_quarantine_path}")
         logging.info(f"Using custom quarantine path: {effective_quarantine_path}")
     else:
         effective_quarantine_path = os.path.join(directory_to_scan, "Deletions") # Default
-        print(f"Quarantine Active: Files marked for removal will be moved to default path: {effective_quarantine_path}")
         logging.info(f"Using default quarantine path: {effective_quarantine_path}")
     
-    # --- Initial File Scan ---
-    print(f"Scanning for audio files in: {directory_to_scan} ...")
+    # Normalize the quarantine path for reliable comparison
+    # os.path.normcase is important for case-insensitive filesystems (like Windows)
+    # os.path.abspath ensures we're comparing absolute paths
+    norm_effective_quarantine_path = os.path.normcase(os.path.abspath(effective_quarantine_path))
+
+    print(f"Quarantine Active: Files marked for removal will be moved to: {effective_quarantine_path}")
+    print(f"Scanning for audio files in: {directory_to_scan} (excluding quarantine path: {effective_quarantine_path})...")
+    logging.info(f"Quarantine path for exclusion during scan: {effective_quarantine_path}")
+    
     audio_files = []
-    for root, _, files_in_root in os.walk(directory_to_scan):
+    # Use topdown=True so we can modify `dirs` list in-place to prevent os.walk from descending
+    for root, dirs, files_in_root in os.walk(directory_to_scan, topdown=True):
+        abs_current_root = os.path.abspath(root)
+        norm_current_root = os.path.normcase(abs_current_root)
+
+        # If the current root directory itself is the quarantine path or a subdirectory of it,
+        # clear the 'dirs' list for this path and skip adding files from this 'root'.
+        if norm_current_root == norm_effective_quarantine_path or \
+           norm_current_root.startswith(norm_effective_quarantine_path + os.sep):
+            logging.debug(f"Skipping scan within quarantine directory: {root}")
+            dirs[:] = []  # Prune subdirectories from further traversal
+            continue      # Skip processing files in this root
+
+        # Additionally, explicitly remove the quarantine directory from the list of subdirectories to visit
+        # if it's a direct child of the current 'root'. This ensures we don't even step into it.
+        # (This part might be somewhat redundant due to the check above, but provides an extra layer of explicit pruning)
+        # We need to iterate over a copy of 'dirs' if modifying it, or build a new list.
+        dirs_to_visit = []
+        for d in dirs:
+            prospective_path = os.path.normcase(os.path.abspath(os.path.join(root, d)))
+            if prospective_path == norm_effective_quarantine_path:
+                logging.debug(f"Pruning quarantine directory from traversal list: {os.path.join(root, d)}")
+            else:
+                dirs_to_visit.append(d)
+        dirs[:] = dirs_to_visit # Update dirs with the filtered list
+
+        # Process files in the current (non-quarantine) directory
         for file_basename in files_in_root:
             if file_basename.lower().endswith(('.mp3', '.wav', '.flac', '.m4a', '.ogg', '.aac', '.opus', '.wma', '.aiff', '.ape')):
-                audio_files.append(os.path.join(root, file_basename))
+                full_file_path = os.path.join(root, file_basename) # Ensure full path is used
+                audio_files.append(full_file_path)
 
     if not audio_files:
-        msg = 'No audio files found in the directory or its subfolders.'
+        msg = f'No audio files found in "{directory_to_scan}" (excluding quarantine path).'
         print(msg)
         logging.info(msg)
         exit(0)
 
-    print(f"Found {len(audio_files)} audio files. Starting analysis...")
-    logging.info(f"Found {len(audio_files)} audio files for analysis.")
+    print(f"Found {len(audio_files)} audio files (excluding quarantine path). Starting analysis...")
+    logging.info(f"Found {len(audio_files)} audio files (excluding quarantine path) for analysis.")
 
     # --- Duplicate Detection (Acoustic Fingerprinting with Caching) ---
     duplicates = {}
@@ -576,17 +637,38 @@ def main():
         
         save_fingerprint_cache(cache_file_path, current_run_valid_cache_entries)
 
+        logging.info("Fingerprint processing complete. Identifying duplicates from map.")
         print("\n-- Identifying duplicates from fingerprints...")
         for (fp_bytes, duration_group), files_list in tqdm(fingerprint_map.items(), desc="Processing fingerprints", unit="group", smoothing=0.1, bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}{postfix}]'):
             if len(files_list) > 1:
-                files_list.sort(key=lambda x: (os.path.getsize(x) if os.path.exists(x) else 0, x), reverse=True) 
-                canonical_file = files_list[0]
-                duplicate_copies = files_list[1:]
+                # New sorting logic to prioritize files NOT in the "Unsorted" path
+                def sort_key_for_duplicates(filepath_str):
+                    # True if in "Unsorted" (comes later), False if not (comes first)
+                    in_unsorted_folder = is_in_target_path_pattern(filepath_str, UNSORTED_PATH_MARKER_SEGMENTS)
+                    
+                    size = 0
+                    if os.path.exists(filepath_str):
+                        try:
+                            size = os.path.getsize(filepath_str)
+                        except OSError as e:
+                            logging.warning(f"Could not get size for {filepath_str} during sort: {e}")
+                    # Sort order:
+                    # 1. Not in unsorted (False) before in unsorted (True)
+                    # 2. Larger files first (hence -size)
+                    # 3. Filepath string as a final tie-breaker
+                    return (in_unsorted_folder, -size, filepath_str)
+
+                files_list.sort(key=sort_key_for_duplicates) 
+                
+                canonical_file = files_list[0]  # This will be the one to keep
+                duplicate_copies = files_list[1:] # These are candidates for quarantine
+
                 if duplicate_copies:
                     duplicates[canonical_file] = duplicate_copies
+                    logging.info(f"Duplicate set identified. Canonical (to keep): '{canonical_file}'. Duplicates for quarantine: '{', '.join(duplicate_copies)}'") # Log clearly
 
         if duplicates:
-            prompt_to_remove_duplicates(duplicates, effective_quarantine_path, args.dry_run) # Pass quarantine_path
+            prompt_to_remove_duplicates(duplicates, effective_quarantine_path, args.dry_run)
         else:
             msg = 'No acoustically similar duplicate audio files found.'
             print(msg)

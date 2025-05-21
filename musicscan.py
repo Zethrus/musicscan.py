@@ -90,7 +90,8 @@ def get_audio_fingerprint(filepath):
 def prompt_to_remove_duplicates(duplicates, dry_run=False):
     if not duplicates:
         logging.info("No duplicates found to prompt for removal.")
-        # print("\nNo acoustically similar duplicate audio files found to process for removal.") # Already handled in main
+        # The main function usually prints a message like "No duplicates found" if the duplicates dict is empty,
+        # so no need to print to console here.
         return
 
     print('\nThe following acoustically similar files (duplicates) were found and will be processed individually:')
@@ -107,7 +108,7 @@ def prompt_to_remove_duplicates(duplicates, dry_run=False):
 
     for canonical_file, dupe_list in sorted_duplicate_sets:
         if quit_mode:
-            break
+            break # Stop processing any more duplicate sets if user quit
         
         print(f"\n--- Processing Duplicates for Canonical File ---")
         print(f"  Keeping (Canonical): {canonical_file}")
@@ -137,7 +138,7 @@ def prompt_to_remove_duplicates(duplicates, dry_run=False):
 
             if remove_all_mode:
                 should_remove_current_file = True
-                # No specific print here, the action print below will cover it.
+                # No specific print here for the action yet, action print below covers it.
                 logging.info(f"Auto-processing (due to 'yes to all') duplicate file: {file_to_remove}")
             else:
                 user_response = input("\tRemove this duplicate file? (y/n/a/q - yes/no/yes to ALL subsequent/quit ALL subsequent): ").strip().lower()
@@ -153,7 +154,8 @@ def prompt_to_remove_duplicates(duplicates, dry_run=False):
                     quit_mode = True
                     logging.info("User chose 'quit'. Halting all duplicate file removal processing.")
                     print("\tQuitting duplicate file removal.")
-                    break # Break from inner loop (processing files in current dupe_list)
+                    # We break from the inner loop here; the outer loop will catch quit_mode to stop further sets.
+                    break 
                 elif user_response == 'n':
                     logging.info(f"User chose 'no' for duplicate file: {file_to_remove}")
                     print(f"\tSkipped: {file_to_remove}")
@@ -175,32 +177,35 @@ def prompt_to_remove_duplicates(duplicates, dry_run=False):
                         logging.error(error_msg)
                 elif dry_run: # Count simulated removals in dry run
                     files_removed_count += 1
-        # After processing all files in a dupe_list, if quit_mode is True, the outer loop will catch it.
+        # After processing all files in a dupe_list for a canonical_file,
+        # if quit_mode is True, the outer loop will check it and break.
     
-    # Summarize actions after processing all duplicate sets
+    # Summarize actions after processing all duplicate sets (or quitting)
     if files_removed_count > 0:
         action_verb = "simulated removing" if dry_run else "removed"
         print(f"\nFinished duplicate processing. {action_verb.capitalize()} {files_removed_count} file(s).")
         logging.info(f"Finished duplicate processing. {action_verb.capitalize()} {files_removed_count} file(s).")
     elif processed_in_prompt_loop > 0 and not quit_mode:
-        # This means user was prompted for at least one file but chose not to remove any
+        # This means the user was prompted for at least one file but chose not to remove any
+        # (or any chosen had errors and weren't counted in files_removed_count).
         print("\nFinished duplicate processing. No files were removed based on your choices.")
         logging.info("Finished duplicate processing. No files were removed based on user choices (all 'n' or invalid responses).")
     elif quit_mode:
-        # Message for quitting is already printed. If removed_count > 0, that summary is also shown.
-        if files_removed_count == 0: # Ensure a message if quit before any 'y' or 'a' led to removal
+        # Message for quitting is already printed when 'q' is selected.
+        # If files_removed_count > 0 before quitting, that summary is also shown.
+        # This specific case is if quit happened AND no files were removed.
+        if files_removed_count == 0:
              print("\nDuplicate file removal process was quit by user; no files were removed during this phase.")
              logging.info("Duplicate file removal process was quit by user; no files were removed during this phase.")
     elif not duplicates: 
-        # This case is handled at the very beginning of the function.
+        # This case is handled at the very beginning of the function by returning early.
         pass
     else: 
         # This means `duplicates` was not empty, but `processed_in_prompt_loop` remained 0.
-        # This could happen if all listed duplicates for all sets were already missing.
+        # This could happen if all listed duplicates for all sets were already missing from the filesystem.
         if processed_in_prompt_loop == 0:
             print("\nFinished duplicate processing. No duplicate files were available for interaction (perhaps already removed or paths were invalid).")
-            logging.info("Finished duplicate processing. No duplicate files were available for interaction.")
-
+            logging.info("Finished duplicate processing. No duplicate files were available for interaction (e.g., all missing on disk).")
 
 def rename_files_from_metadata(filepath, dry_run=False):
     try:

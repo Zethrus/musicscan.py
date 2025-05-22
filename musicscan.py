@@ -679,12 +679,13 @@ def main():
         print("\nSkipping low bitrate file check as per --skip-low-bitrate flag.")
         logging.info("Skipping low bitrate file check as per --skip-low-bitrate flag.")
     else:
-        # Changed prompt from "delete" to "quarantine"
         response_check_low_br = input(f'\nWould you like to scan for files with bitrates lower than {BITRATE_THRESHOLD/1000:.0f}kbps (to quarantine them)? (y/n): ')
         if response_check_low_br.lower() == 'y':
-            low_bitrate_files = []
+            low_bitrate_files = [] # This list will store paths of low bitrate files
             print(f"\n-- Checking for files with bitrates lower than {BITRATE_THRESHOLD/1000:.0f}kbps (using {num_workers} workers)...")
+            logging.info(f"Starting low bitrate file check (threshold: {BITRATE_THRESHOLD}bps) using {num_workers} workers.")
             
+            # Ensure files_for_bitrate_check considers only existing files from the initial scan
             files_for_bitrate_check = [f for f in audio_files if os.path.exists(f)]
             with ThreadPoolExecutor(max_workers=num_workers) as executor:
                 future_to_file = {
@@ -694,14 +695,19 @@ def main():
                 for future in tqdm(future_to_file, desc=f"Checking bitrates (<{BITRATE_THRESHOLD/1000:.0f}kbps)", total=len(future_to_file), unit="file", smoothing=0.1, bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}{postfix}]'):
                     file_path = future_to_file[future]
                     try:
-                        if future.result(): 
+                        if future.result(): # True if bitrate is low
                              low_bitrate_files.append(file_path)
                     except Exception as exc:
                         logging.error(f'{os.path.basename(file_path)} generated an exception during bitrate check: {exc}')
             
             if low_bitrate_files:
+                # *** NEW: Define the specific subfolder for low-bitrate files ***
+                low_bitrate_quarantine_target_path = os.path.join(effective_quarantine_path, "low-bitrate")
+                
                 print(f'\nFound {len(low_bitrate_files)} file(s) with bitrates lower than {BITRATE_THRESHOLD/1000:.0f}kbps.')
-                logging.info(f"Found {len(low_bitrate_files)} low bitrate files. Prompting for individual quarantining.")
+                # Inform user about the specific subfolder for these files
+                print(f"These files, if quarantined, will be moved to: {low_bitrate_quarantine_target_path}")
+                logging.info(f"Found {len(low_bitrate_files)} low bitrate files. Prompting for individual quarantining to '{low_bitrate_quarantine_target_path}'.")
                 
                 quarantined_count = 0 
                 processed_in_prompt_loop = 0
@@ -724,15 +730,15 @@ def main():
                         should_quarantine_current_file = True
                         logging.info(f"Auto-processing (due to 'yes to all') low bitrate file for quarantine: {file_path}")
                     else:
-                        user_response = input("Move this file to quarantine? (y/n/a/q): ").strip().lower()
+                        user_response = input(f"Move this file to quarantine subfolder '{os.path.basename(low_bitrate_quarantine_target_path)}'? (y/n/a/q): ").strip().lower() # Updated prompt
                         
                         if user_response == 'y':
                             should_quarantine_current_file = True
-                            logging.info(f"User chose 'yes' to quarantine low bitrate file: {file_path}")
+                            logging.info(f"User chose 'yes' to quarantine low bitrate file: {file_path} to {low_bitrate_quarantine_target_path}")
                         elif user_response == 'a':
                             should_quarantine_current_file = True
                             remove_all_mode = True
-                            logging.info(f"User chose 'yes to all' to quarantine. Will quarantine current and all subsequent: {file_path}")
+                            logging.info(f"User chose 'yes to all' to quarantine. Will quarantine current and all subsequent low bitrate files to {low_bitrate_quarantine_target_path}, starting with: {file_path}")
                         elif user_response == 'q':
                             quit_mode = True
                             logging.info("User chose 'quit'. Halting low bitrate file quarantine process.")
@@ -746,22 +752,27 @@ def main():
                             logging.warning(f"Invalid input '{user_response}' for low bitrate file {file_path}. Skipped.")
 
                     if should_quarantine_current_file:
-                        # Use the move_file_to_quarantine helper
-                        if move_file_to_quarantine(file_path, effective_quarantine_path, args.dry_run):
+                        # *** MODIFIED: Use the specific low_bitrate_quarantine_target_path ***
+                        if move_file_to_quarantine(file_path, low_bitrate_quarantine_target_path, args.dry_run):
                             quarantined_count += 1
                 
+                # Summary messages remain largely the same, as move_file_to_quarantine logs the specific path
                 if quarantined_count > 0:
                     action_verb = "simulated moving to quarantine" if args.dry_run else "moved to quarantine"
                     print(f"\nFinished low bitrate processing. {action_verb.capitalize()} {quarantined_count} file(s).")
+                    logging.info(f"Finished low bitrate processing. {action_verb.capitalize()} {quarantined_count} file(s) into '{low_bitrate_quarantine_target_path}'.")
                 elif processed_in_prompt_loop > 0 and not quit_mode:
                     print("\nFinished low bitrate processing. No files were moved to quarantine based on your choices.")
+                    logging.info("Finished low bitrate processing. No files moved to quarantine by user choice.")
                 elif quit_mode and quarantined_count == 0:
-                     print("\nLow bitrate file quarantine process was quit by user; no files were moved during this phase.")
-            else: 
+                     print("\nLow bitrate file quarantine process was quit by user; no files were moved to quarantine during this phase.")
+                     logging.info("Low bitrate file quarantine process was quit by user; no files were moved to quarantine during this phase.")
+            
+            else: # No low_bitrate_files found after scan
                 msg = f'No files identified with bitrates lower than {BITRATE_THRESHOLD/1000:.0f}kbps (or were already handled).'
                 print(msg)
                 logging.info(msg)
-        else: 
+        else: # User chose not to scan for low bitrate files
             print('\nScan for low bitrate files skipped by user.')
             logging.info("User chose not to scan for low bitrate files.")
 

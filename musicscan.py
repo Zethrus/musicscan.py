@@ -535,20 +535,15 @@ def main():
         # if it's a direct child of the current 'root'. This ensures we don't even step into it.
         # (This part might be somewhat redundant due to the check above, but provides an extra layer of explicit pruning)
         # We need to iterate over a copy of 'dirs' if modifying it, or build a new list.
-        dirs_to_visit = []
-        for d in dirs:
-            prospective_path = os.path.normcase(os.path.abspath(os.path.join(root, d)))
-            if prospective_path == norm_effective_quarantine_path:
-                logging.debug(f"Pruning quarantine directory from traversal list: {os.path.join(root, d)}")
-            else:
-                dirs_to_visit.append(d)
-        dirs[:] = dirs_to_visit # Update dirs with the filtered list
+        dirs_to_visit = [d for d in dirs if not (os.path.normcase(os.path.abspath(os.path.join(root, d))) == norm_effective_quarantine_path)]
+        if len(dirs_to_visit) < len(dirs):
+            logging.debug(f"Pruned quarantine directory from sub-traversal of {root}")
+        dirs[:] = dirs_to_visit
 
         # Process files in the current (non-quarantine) directory
         for file_basename in files_in_root:
             if file_basename.lower().endswith(('.mp3', '.wav', '.flac', '.m4a', '.ogg', '.aac', '.opus', '.wma', '.aiff', '.ape')):
-                full_file_path = os.path.join(root, file_basename) # Ensure full path is used
-                audio_files.append(full_file_path)
+                audio_files.append(os.path.join(root, file_basename))
 
     if not audio_files:
         msg = f'No audio files found in "{directory_to_scan}" (excluding quarantine path).'
@@ -563,218 +558,184 @@ def main():
     duplicates = {}
     can_fingerprint_system_ok = check_fpcalc_executable()
 
+    # This dictionary will hold all cache entries valid for THIS RUN.
+    # It's built from existing cache + new fingerprints, and then updated by user choices.
+    # This is what gets saved at the end.
+    current_run_valid_cache_entries = {}
+    fp_cache_from_disk = {}
+    cache_file_path = os.path.join(directory_to_scan, CACHE_FILENAME)
+
+    if not args.force_re_fingerprint:
+        fp_cache_from_disk = load_fingerprint_cache(cache_file_path)
+
+    logging.info("Initializing working cache with valid entries from disk/current file stats.")
+    for f_path in tqdm(audio_files, desc="Validating cache state", unit="file", smoothing=0.1, bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}{postfix}]'):
+        abs_f_path = os.path.abspath(f_path)
+        if os.path.exists(abs_f_path):
+            try:
+                current_mtime = os.path.getmtime(abs_f_path)
+                current_size = os.path.getsize(abs_f_path)
+                disk_cached_entry = fp_cache_from_disk.get(abs_f_path)
+
+                if disk_cached_entry and \
+                   disk_cached_entry.get("mtime") == current_mtime and \
+                   disk_cached_entry.get("size") == current_size:
+                    current_run_valid_cache_entries[abs_f_path] = disk_cached_entry.copy()
+                    logging.debug(f"Pre-loaded valid cache entry for {os.path.basename(abs_f_path)}")
+                else: # No valid entry on disk, or file changed. Store current mtime/size.
+                    current_run_valid_cache_entries[abs_f_path] = {"mtime": current_mtime, "size": current_size}
+                    if disk_cached_entry: logging.debug(f"Cache entry for {os.path.basename(abs_f_path)} was stale or incomplete.")
+                    else: logging.debug(f"No cache entry found for {os.path.basename(abs_f_path)} during pre-load.")
+            except OSError as e:
+                logging.warning(f"Could not stat file {abs_f_path} during initial cache population: {e}")
+    
+    # --- Duplicate Detection (Acoustic Fingerprinting) ---
+    duplicates = {}
+    can_fingerprint_system_ok = check_fpcalc_executable()
+
     if args.skip_duplicates:
         print("\nSkipping duplicate detection as per --skip-duplicates flag.")
-        logging.info("Skipping duplicate detection as per --skip-duplicates flag.")
     elif not can_fingerprint_system_ok:
-        print("\nSkipping duplicate detection via audio fingerprinting as 'fpcalc' utility is not available.")
-        logging.warning("Skipping duplicate detection: fpcalc not found.")
+        print("\nSkipping duplicate detection: 'fpcalc' utility not available.")
     else:
-        cache_file_path = os.path.join(directory_to_scan, CACHE_FILENAME)
-        fp_cache_from_disk = {}
-        if not args.force_re_fingerprint:
-            fp_cache_from_disk = load_fingerprint_cache(cache_file_path)
-        else:
-            logging.info("Forcing re-fingerprint of all files, cache will be ignored for loading but rebuilt.")
-            print("\nForcing re-fingerprint of all files, ignoring existing cache.")
-
-        current_run_valid_cache_entries = {} 
         fingerprint_map = collections.defaultdict(list)
         files_needing_fingerprinting = []
 
-        print("\n-- Checking fingerprint cache and identifying files for new fingerprinting...")
-        logging.info("Checking fingerprint cache.")
-        
-        valid_audio_files_for_processing = [f for f in audio_files if os.path.exists(f)]
-
-        for filepath in tqdm(valid_audio_files_for_processing, desc="Cache Check", unit="file", smoothing=0.1, bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}{postfix}]'):
-            try:
-                abs_filepath = os.path.abspath(filepath) 
-                file_mtime = os.path.getmtime(abs_filepath)
-                file_size = os.path.getsize(abs_filepath)
-                cached_data = fp_cache_from_disk.get(abs_filepath)
-                
-                if cached_data and \
-                   cached_data.get("mtime") == file_mtime and \
-                   cached_data.get("size") == file_size and \
-                   cached_data.get("fingerprint_hex") and \
-                   cached_data.get("duration") is not None:
-                    fp_bytes = bytes.fromhex(cached_data["fingerprint_hex"])
-                    duration = cached_data["duration"]
-                    duration_key = round(duration)
+        print("\n-- Checking which files need fingerprinting...")
+        for abs_filepath, entry_data in tqdm(current_run_valid_cache_entries.items(), desc="Preparing for fingerprinting", unit="file", smoothing=0.1, bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}{postfix}]'):
+            if args.force_re_fingerprint or "fingerprint_hex" not in entry_data or "duration" not in entry_data:
+                files_needing_fingerprinting.append(abs_filepath) # Pass path directly
+                if args.force_re_fingerprint: logging.debug(f"Forcing re-fingerprint for {os.path.basename(abs_filepath)}.")
+                else: logging.debug(f"Queued for fingerprinting (missing data): {os.path.basename(abs_filepath)}.")
+            else: # Use existing valid fingerprint from current_run_valid_cache_entries
+                try:
+                    fp_bytes = bytes.fromhex(entry_data["fingerprint_hex"])
+                    duration_key = round(entry_data["duration"])
                     fingerprint_map[(fp_bytes, duration_key)].append(abs_filepath)
-                    current_run_valid_cache_entries[abs_filepath] = cached_data 
-                else:
-                    files_needing_fingerprinting.append({'path': abs_filepath, 'mtime': file_mtime, 'size': file_size})
-            except OSError as e:
-                logging.warning(f"Could not stat file {filepath} for cache check: {e}")
-
+                except (ValueError, TypeError) as e:
+                    logging.warning(f"Error using cached FP for {abs_filepath}: {e}. Queuing for re-FP.")
+                    files_needing_fingerprinting.append(abs_filepath)
+        
         if files_needing_fingerprinting:
-            print(f"\n-- Generating {len(files_needing_fingerprinting)} new/updated audio fingerprints (using {num_workers} workers)...")
+            print(f"\n-- Generating {len(files_needing_fingerprinting)} audio fingerprints (using {num_workers} workers)...")
             with ThreadPoolExecutor(max_workers=num_workers) as executor:
-                future_to_fileinfo = {
-                    executor.submit(get_audio_fingerprint, fileinfo['path']): fileinfo
-                    for fileinfo in files_needing_fingerprinting
-                }
-                for future in tqdm(future_to_fileinfo, desc="Fingerprinting files", total=len(future_to_fileinfo), unit="file", smoothing=0.1, bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}{postfix}]'):
-                    fileinfo = future_to_fileinfo[future]
-                    abs_filepath = fileinfo['path']
+                future_to_filepath = { executor.submit(get_audio_fingerprint, fp): fp for fp in files_needing_fingerprinting }
+                for future in tqdm(future_to_filepath, desc="Fingerprinting files", total=len(future_to_filepath), unit="file", smoothing=0.1, bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}{postfix}]'):
+                    abs_filepath = future_to_filepath[future]
                     try:
                         duration, fp_bytes = future.result()
                         if fp_bytes is not None and duration is not None:
                             duration_key = round(duration)
                             fingerprint_map[(fp_bytes, duration_key)].append(abs_filepath)
-                            current_run_valid_cache_entries[abs_filepath] = { 
-                                "fingerprint_hex": fp_bytes.hex(),
-                                "duration": duration,
-                                "mtime": fileinfo['mtime'],
-                                "size": fileinfo['size']
-                            }
-                    except Exception as e:
-                        logging.error(f"Error processing fingerprint result for {abs_filepath}: {e}")
+                            # Update working cache with new fingerprint data
+                            entry = current_run_valid_cache_entries.setdefault(abs_filepath, {}) # Ensure entry exists
+                            entry.update({ 
+                                "fingerprint_hex": fp_bytes.hex(), "duration": duration,
+                                "mtime": os.path.getmtime(abs_filepath), "size": os.path.getsize(abs_filepath)
+                            })
+                            entry.pop("low_bitrate_ignored", None) # Reset ignore flag on re-fingerprint
+                    except Exception as e: logging.error(f"Error processing fingerprint result for {abs_filepath}: {e}")
         elif not args.force_re_fingerprint: 
-            print("\n-- No new files to fingerprint. All valid fingerprints loaded from cache.")
+            print("\n-- No new files needed fingerprinting based on cache status.")
         
-        save_fingerprint_cache(cache_file_path, current_run_valid_cache_entries)
-
-        logging.info("Fingerprint processing complete. Identifying duplicates from map.")
         print("\n-- Identifying duplicates from fingerprints...")
         for (fp_bytes, duration_group), files_list in tqdm(fingerprint_map.items(), desc="Processing fingerprints", unit="group", smoothing=0.1, bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}{postfix}]'):
             if len(files_list) > 1:
-                # New sorting logic to prioritize files NOT in the "Unsorted" path
                 def sort_key_for_duplicates(filepath_str):
-                    # True if in "Unsorted" (comes later), False if not (comes first)
                     in_unsorted_folder = is_in_target_path_pattern(filepath_str, UNSORTED_PATH_MARKER_SEGMENTS)
-                    
                     size = 0
                     if os.path.exists(filepath_str):
-                        try:
-                            size = os.path.getsize(filepath_str)
-                        except OSError as e:
-                            logging.warning(f"Could not get size for {filepath_str} during sort: {e}")
-                    # Sort order:
-                    # 1. Not in unsorted (False) before in unsorted (True)
-                    # 2. Larger files first (hence -size)
-                    # 3. Filepath string as a final tie-breaker
+                        try: size = os.path.getsize(filepath_str)
+                        except OSError as e: logging.warning(f"Could not get size for {filepath_str} during sort: {e}")
                     return (in_unsorted_folder, -size, filepath_str)
-
                 files_list.sort(key=sort_key_for_duplicates) 
-                
-                canonical_file = files_list[0]  # This will be the one to keep
-                duplicate_copies = files_list[1:] # These are candidates for quarantine
+                canonical_file = files_list[0]
+                duplicate_copies = files_list[1:]
+                if duplicate_copies: duplicates[canonical_file] = duplicate_copies
 
-                if duplicate_copies:
-                    duplicates[canonical_file] = duplicate_copies
-                    logging.info(f"Duplicate set identified. Canonical (to keep): '{canonical_file}'. Duplicates for quarantine: '{', '.join(duplicate_copies)}'") # Log clearly
-
-        if duplicates:
-            prompt_to_remove_duplicates(duplicates, effective_quarantine_path, args.dry_run)
-        else:
-            msg = 'No acoustically similar duplicate audio files found.'
-            print(msg)
-            logging.info(msg)
+        if duplicates: prompt_to_remove_duplicates(duplicates, effective_quarantine_path, args.dry_run)
+        else: print('No acoustically similar duplicate audio files found.'); logging.info('No duplicates found.')
 
     # --- Low Bitrate File Check ---
     if args.skip_low_bitrate:
-        print("\nSkipping low bitrate file check as per --skip-low-bitrate flag.")
-        logging.info("Skipping low bitrate file check as per --skip-low-bitrate flag.")
+        print("\nSkipping low bitrate file check.")
     else:
-        response_check_low_br = input(f'\nWould you like to scan for files with bitrates lower than {BITRATE_THRESHOLD/1000:.0f}kbps (to quarantine them)? (y/n): ')
+        response_check_low_br = input(f'\nWould you like to scan for files with bitrates < {BITRATE_THRESHOLD/1000:.0f}kbps (to quarantine them)? (y/n): ')
         if response_check_low_br.lower() == 'y':
-            low_bitrate_files = [] # This list will store paths of low bitrate files
-            print(f"\n-- Checking for files with bitrates lower than {BITRATE_THRESHOLD/1000:.0f}kbps (using {num_workers} workers)...")
-            logging.info(f"Starting low bitrate file check (threshold: {BITRATE_THRESHOLD}bps) using {num_workers} workers.")
-            
-            # Ensure files_for_bitrate_check considers only existing files from the initial scan
+            low_bitrate_files_initially_detected = []
+            print(f"\n-- Checking for low bitrate files (using {num_workers} workers)...")
             files_for_bitrate_check = [f for f in audio_files if os.path.exists(f)]
             with ThreadPoolExecutor(max_workers=num_workers) as executor:
-                future_to_file = {
-                    executor.submit(check_bitrate, file_path): file_path 
-                    for file_path in files_for_bitrate_check
-                }
-                for future in tqdm(future_to_file, desc=f"Checking bitrates (<{BITRATE_THRESHOLD/1000:.0f}kbps)", total=len(future_to_file), unit="file", smoothing=0.1, bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}{postfix}]'):
-                    file_path = future_to_file[future]
-                    try:
-                        if future.result(): # True if bitrate is low
-                             low_bitrate_files.append(file_path)
-                    except Exception as exc:
-                        logging.error(f'{os.path.basename(file_path)} generated an exception during bitrate check: {exc}')
+                future_to_file = { executor.submit(check_bitrate, fp): fp for fp in files_for_bitrate_check }
+                for future in tqdm(future_to_file, desc=f"Checking bitrates", total=len(future_to_file), unit="file", smoothing=0.1, bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}{postfix}]'):
+                    if future.result(): low_bitrate_files_initially_detected.append(future_to_file[future])
             
-            if low_bitrate_files:
-                # *** NEW: Define the specific subfolder for low-bitrate files ***
+            if low_bitrate_files_initially_detected:
+                low_bitrate_files_to_prompt = []
                 low_bitrate_quarantine_target_path = os.path.join(effective_quarantine_path, "low-bitrate")
                 
-                print(f'\nFound {len(low_bitrate_files)} file(s) with bitrates lower than {BITRATE_THRESHOLD/1000:.0f}kbps.')
-                # Inform user about the specific subfolder for these files
-                print(f"These files, if quarantined, will be moved to: {low_bitrate_quarantine_target_path}")
-                logging.info(f"Found {len(low_bitrate_files)} low bitrate files. Prompting for individual quarantining to '{low_bitrate_quarantine_target_path}'.")
-                
-                quarantined_count = 0 
-                processed_in_prompt_loop = 0
-                remove_all_mode = False 
-                quit_mode = False       
-
-                for i, file_path in enumerate(low_bitrate_files):
-                    if quit_mode: break
-                    if not os.path.exists(file_path):
-                        logging.warning(f"Low bitrate file {file_path} no longer exists. Skipping.")
-                        continue
-                    
-                    processed_in_prompt_loop += 1
-                    should_quarantine_current_file = False
-                    
-                    print(f"\n--- File {i+1} of {len(low_bitrate_files)} ---")
-                    print(f"Low bitrate candidate: {file_path}")
-
-                    if remove_all_mode:
-                        should_quarantine_current_file = True
-                        logging.info(f"Auto-processing (due to 'yes to all') low bitrate file for quarantine: {file_path}")
-                    else:
-                        user_response = input(f"Move this file to quarantine subfolder '{os.path.basename(low_bitrate_quarantine_target_path)}'? (y/n/a/q): ").strip().lower() # Updated prompt
+                print(f"\n-- Filtering {len(low_bitrate_files_initially_detected)} potential low bitrate files against cache 'ignore' status...")
+                for file_path in tqdm(low_bitrate_files_initially_detected, desc="Checking ignored low bitrate", unit="file", smoothing=0.1, bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}{postfix}]'):
+                    abs_filepath = os.path.abspath(file_path)
+                    try:
+                        if not os.path.exists(abs_filepath): continue
+                        current_mtime = os.path.getmtime(abs_filepath)
+                        current_size = os.path.getsize(abs_filepath)
+                        cached_entry = current_run_valid_cache_entries.get(abs_filepath)
                         
-                        if user_response == 'y':
-                            should_quarantine_current_file = True
-                            logging.info(f"User chose 'yes' to quarantine low bitrate file: {file_path} to {low_bitrate_quarantine_target_path}")
-                        elif user_response == 'a':
-                            should_quarantine_current_file = True
-                            remove_all_mode = True
-                            logging.info(f"User chose 'yes to all' to quarantine. Will quarantine current and all subsequent low bitrate files to {low_bitrate_quarantine_target_path}, starting with: {file_path}")
-                        elif user_response == 'q':
-                            quit_mode = True
-                            logging.info("User chose 'quit'. Halting low bitrate file quarantine process.")
-                            print("Quitting low bitrate file quarantine.")
-                            break 
-                        elif user_response == 'n':
-                            logging.info(f"User chose 'no' for quarantining low bitrate file: {file_path}")
-                            print(f"Skipped: {file_path}")
+                        if cached_entry and \
+                           cached_entry.get("mtime") == current_mtime and \
+                           cached_entry.get("size") == current_size and \
+                           cached_entry.get("low_bitrate_ignored") is True:
+                            logging.info(f"Skipping low bitrate prompt for {os.path.basename(abs_filepath)} (previously ignored and unchanged).")
                         else:
-                            print(f"Invalid input '{user_response}'. Skipped: {file_path}")
-                            logging.warning(f"Invalid input '{user_response}' for low bitrate file {file_path}. Skipped.")
-
-                    if should_quarantine_current_file:
-                        # *** MODIFIED: Use the specific low_bitrate_quarantine_target_path ***
-                        if move_file_to_quarantine(file_path, low_bitrate_quarantine_target_path, args.dry_run):
-                            quarantined_count += 1
+                            low_bitrate_files_to_prompt.append(file_path)
+                            entry_to_update = current_run_valid_cache_entries.setdefault(abs_filepath, {"mtime": current_mtime, "size": current_size})
+                            entry_to_update["low_bitrate_ignored"] = False # Explicitly mark for prompting / not ignored
+                    except OSError as e: logging.warning(f"Could not stat {abs_filepath} during low bitrate ignore check: {e}")
                 
-                # Summary messages remain largely the same, as move_file_to_quarantine logs the specific path
-                if quarantined_count > 0:
-                    action_verb = "simulated moving to quarantine" if args.dry_run else "moved to quarantine"
-                    print(f"\nFinished low bitrate processing. {action_verb.capitalize()} {quarantined_count} file(s).")
-                    logging.info(f"Finished low bitrate processing. {action_verb.capitalize()} {quarantined_count} file(s) into '{low_bitrate_quarantine_target_path}'.")
-                elif processed_in_prompt_loop > 0 and not quit_mode:
-                    print("\nFinished low bitrate processing. No files were moved to quarantine based on your choices.")
-                    logging.info("Finished low bitrate processing. No files moved to quarantine by user choice.")
-                elif quit_mode and quarantined_count == 0:
-                     print("\nLow bitrate file quarantine process was quit by user; no files were moved to quarantine during this phase.")
-                     logging.info("Low bitrate file quarantine process was quit by user; no files were moved to quarantine during this phase.")
-            
-            else: # No low_bitrate_files found after scan
-                msg = f'No files identified with bitrates lower than {BITRATE_THRESHOLD/1000:.0f}kbps (or were already handled).'
-                print(msg)
-                logging.info(msg)
-        else: # User chose not to scan for low bitrate files
-            print('\nScan for low bitrate files skipped by user.')
-            logging.info("User chose not to scan for low bitrate files.")
+                if low_bitrate_files_to_prompt:
+                    print(f'\nFound {len(low_bitrate_files_to_prompt)} file(s) needing review for low bitrate.')
+                    print(f"Low bitrate files will be quarantined to: {low_bitrate_quarantine_target_path}")
+                    quarantined_count = 0; processed_in_prompt_loop = 0
+                    remove_all_mode = False; quit_mode = False       
+                    for i, file_path in enumerate(low_bitrate_files_to_prompt):
+                        if quit_mode: break
+                        if not os.path.exists(file_path): continue
+                        processed_in_prompt_loop += 1
+                        should_quarantine = False; abs_fp_prompt = os.path.abspath(file_path)
+                        print(f"\n--- File {i+1} of {len(low_bitrate_files_to_prompt)} ---\nLow bitrate candidate: {file_path}")
+                        if remove_all_mode: should_quarantine = True
+                        else:
+                            resp = input("Move to quarantine? (y/n/a/q): ").strip().lower()
+                            if resp == 'y': should_quarantine = True
+                            elif resp == 'a': should_quarantine = True; remove_all_mode = True
+                            elif resp == 'q': quit_mode = True; print("Quitting low bitrate quarantine."); break
+                            elif resp == 'n':
+                                print(f"Skipped (will be ignored next time if unchanged): {file_path}")
+                                entry = current_run_valid_cache_entries.setdefault(abs_fp_prompt, {})
+                                entry["low_bitrate_ignored"] = True
+                                try: # Ensure mtime/size are current for this ignore decision
+                                    entry["mtime"] = os.path.getmtime(abs_fp_prompt)
+                                    entry["size"] = os.path.getsize(abs_fp_prompt)
+                                except OSError as e: logging.error(f"Could not update mtime/size for ignored low-bitrate {abs_fp_prompt}: {e}")
+                            else: print(f"Invalid input. Skipped: {file_path}")
+                        if should_quarantine:
+                            if move_file_to_quarantine(file_path, low_bitrate_quarantine_target_path, args.dry_run):
+                                quarantined_count += 1
+                                entry = current_run_valid_cache_entries.setdefault(abs_fp_prompt, {})
+                                entry["low_bitrate_ignored"] = False # Actioned, so not ignored
+                                try: # Update mtime/size for the record before it's moved from original path
+                                    entry["mtime"] = os.path.getmtime(abs_fp_prompt) 
+                                    entry["size"] = os.path.getsize(abs_fp_prompt)
+                                except OSError: pass # file might be moved already if not dry_run
+                    # Summaries for low bitrate
+                    if quarantined_count > 0: print(f"\nFinished low bitrate. {'Simulated moving' if args.dry_run else 'Moved'} {quarantined_count} file(s) to quarantine.")
+                    elif processed_in_prompt_loop > 0 and not quit_mode: print("\nFinished low bitrate. No files moved to quarantine by choice.")
+                    elif quit_mode and quarantined_count == 0: print("\nLow bitrate quarantine quit by user; no files moved.")
+                else: print(f"\nAll {len(low_bitrate_files_initially_detected)} potential low bitrate files were previously marked 'ignored' and unchanged, or no longer exist.")
+            else: print(f'\nNo files initially identified with low bitrates < {BITRATE_THRESHOLD/1000:.0f}kbps.')
+        else: print('\nScan for low bitrate files skipped by user.')
 
     # --- Rename files based on metadata (conditionally) ---
     if args.rename_metadata:
@@ -797,6 +758,19 @@ def main():
                 print("No files were renamed based on metadata.")
     else:
         print("\nSkipping renaming files based on metadata.")
+
+    # --- FINAL CACHE SAVE ---
+    final_cache_to_save = { fp: data for fp, data in current_run_valid_cache_entries.items() if os.path.exists(fp) }
+    save_needed_conditions = (not args.skip_duplicates and can_fingerprint_system_ok) or \
+                             (not args.skip_low_bitrate and response_check_low_br.lower() == 'y') or \
+                             args.force_re_fingerprint
+    if 'response_check_low_br' not in locals(): # Handle case where low bitrate scan prompt was skipped
+        save_needed_conditions = (not args.skip_duplicates and can_fingerprint_system_ok) or args.force_re_fingerprint
+
+    if save_needed_conditions:
+        save_fingerprint_cache(cache_file_path, final_cache_to_save)
+    else:
+        logging.info("Skipping cache save as no cache-modifying operations were performed or enabled.")
 
     print('\nFinished scanning and processing.')
     logging.info("Script finished.")

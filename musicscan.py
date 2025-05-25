@@ -11,7 +11,7 @@ import collections
 import time # For mtime
 
 # --- Global Configuration ---
-BITRATE_THRESHOLD = 160000
+# BITRATE_THRESHOLD = 160000 ## Remove hardcoded threshold
 FINGERPRINT_AUDIO_MAX_LENGTH_SECONDS = 0 # 0 means process the whole file
 CACHE_FILENAME = ".musicscan_fp_cache.json"
 UNSORTED_PATH_MARKER_SEGMENTS = ("Music", "Unsorted") # Segments to identify an "unsorted" path
@@ -543,16 +543,22 @@ def rename_files_from_metadata(filepath, dry_run=False):
     return False
 
 
-def check_bitrate(filepath):
+def check_bitrate(filepath, current_bitrate_threshold_bps): # Added threshold parameter
+    """
+    Checks if an audio file has a bitrate lower than the provided threshold.
+    Returns True if bitrate is lower, False otherwise or if error.
+    """
     try:
         audio_m = MutagenFile(filepath)
         if audio_m and hasattr(audio_m, 'info') and hasattr(audio_m.info, 'bitrate'):
-            if audio_m.info.bitrate > 0 and audio_m.info.bitrate < BITRATE_THRESHOLD:
-                logging.debug(f"Mutagen: Low bitrate ({audio_m.info.bitrate/1000:.0f}kbps) for {os.path.basename(filepath)}")
+            # Ensure bitrate is positive before comparing
+            if audio_m.info.bitrate > 0 and audio_m.info.bitrate < current_bitrate_threshold_bps:
+                logging.debug(f"Mutagen: Low bitrate ({audio_m.info.bitrate/1000:.0f}kbps) for {os.path.basename(filepath)} (Threshold: <{current_bitrate_threshold_bps/1000:.0f}kbps)")
                 return True
-            elif audio_m.info.bitrate >= BITRATE_THRESHOLD:
-                logging.debug(f"Mutagen: Sufficient bitrate ({audio_m.info.bitrate/1000:.0f}kbps) for {os.path.basename(filepath)}")
+            elif audio_m.info.bitrate >= current_bitrate_threshold_bps:
+                logging.debug(f"Mutagen: Sufficient bitrate ({audio_m.info.bitrate/1000:.0f}kbps) for {os.path.basename(filepath)} (Threshold: <{current_bitrate_threshold_bps/1000:.0f}kbps)")
                 return False
+            # If bitrate is 0 or not determinable by mutagen, fall through to ffprobe
     except Exception as e:
         logging.debug(f"Mutagen could not determine bitrate for {os.path.basename(filepath)}: {e}. Trying ffprobe.")
 
@@ -565,21 +571,22 @@ def check_bitrate(filepath):
                 if stream.get('codec_type') == 'audio' and 'bit_rate' in stream:
                     try:
                         bitrate = int(stream['bit_rate'])
-                        if bitrate < BITRATE_THRESHOLD:
-                            logging.debug(f"ffprobe: Low bitrate ({bitrate/1000:.0f}kbps) for {os.path.basename(filepath)}")
+                        if bitrate < current_bitrate_threshold_bps:
+                            logging.debug(f"ffprobe: Low bitrate ({bitrate/1000:.0f}kbps) for {os.path.basename(filepath)} (Threshold: <{current_bitrate_threshold_bps/1000:.0f}kbps)")
                             return True
-                        logging.debug(f"ffprobe: Sufficient bitrate ({bitrate/1000:.0f}kbps) for {os.path.basename(filepath)}")
+                        logging.debug(f"ffprobe: Sufficient bitrate ({bitrate/1000:.0f}kbps) for {os.path.basename(filepath)} (Threshold: <{current_bitrate_threshold_bps/1000:.0f}kbps)")
                         return False 
                     except ValueError:
                         logging.warning(f"ffprobe: Could not parse bit_rate '{stream['bit_rate']}' for {os.path.basename(filepath)}")
         logging.debug(f"ffprobe: No suitable audio stream with bitrate found for {os.path.basename(filepath)}")
-        return False 
+        return False # Default to not low if info missing or unparsable
     except subprocess.CalledProcessError as e:
         logging.warning(f"ffprobe command failed for {os.path.basename(filepath)}. Output: {e.stderr.decode(errors='ignore').strip()}")
         return False
-    except (json.JSONDecodeError, ValueError, KeyError) as e:
+    except (json.JSONDecodeError, ValueError, KeyError) as e: # Added KeyError for safety
         logging.warning(f"Could not determine bitrate via ffprobe for {os.path.basename(filepath)}: {e}")
         return False
+    return False # Default case if everything fails
 
 # --- Main script ---
 def main():
@@ -591,7 +598,7 @@ def main():
             "Features include:\n"
             "  - Acoustic duplicate detection using audio fingerprints.\n"
             "    (Requires 'fpcalc' utility from Chromaprint: https://acoustid.org/chromaprint).\n"
-            "  - Identification of files with bitrates below a defined threshold.\n"
+            "  - Identification of files with bitrates below a (now configurable) defined threshold.\n"
             "  - Optional renaming of files based on their 'Artist - Title' metadata.\n"
             "  - Caching of audio fingerprints in the scanned directory \n"
             "    (in a file named '" + CACHE_FILENAME + "') to significantly speed up subsequent scans.\n"
@@ -652,7 +659,15 @@ def main():
     parser.add_argument(
         '--skip-low-bitrate',
         action='store_true',
-        help=f'Skip the low bitrate file detection and associated quarantining prompts. \nThe current bitrate threshold is set to {BITRATE_THRESHOLD/1000:.0f}kbps.' # Updated help
+        help='Skip the low bitrate file detection and associated quarantining prompts. \nUses the threshold from --bitrate (default: 256 kbps).'
+    )
+    parser.add_argument(
+        '--bitrate',
+        type=int,
+        default=256,  # Default in kbps
+        metavar='KBPS',
+        help='Minimum bitrate threshold in kbps. Files below this will be flagged as low bitrate. \n'
+             'Default: 256 kbps.'
     )
     parser.add_argument(
         '--force-re-fingerprint',
@@ -684,6 +699,7 @@ def main():
              'A temporary backup of the original file will be made by this script before repair. \n'
              'Use with EXTREME CAUTION. Requires FFmpeg in PATH.'
     )
+
     args = parser.parse_args()
 
     if args.dry_run:
@@ -705,6 +721,17 @@ def main():
         logging.info(f"Using {num_workers} worker threads based on --max-workers input.")
     
     print(f"Using up to {num_workers} worker threads for parallel tasks.")
+
+    # Determine effective bitrate threshold in BPS
+    if args.bitrate <= 0:
+        print(f"Warning: --bitrate value '{args.bitrate}' must be a positive integer. Using default of 256 kbps.")
+        logging.warning(f"--bitrate input '{args.bitrate}' was invalid. Reverting to default 256 kbps.")
+        effective_bitrate_threshold_bps = 256 * 1000
+    else:
+        effective_bitrate_threshold_bps = args.bitrate * 1000
+        logging.info(f"Using custom bitrate threshold: {args.bitrate} kbps ({effective_bitrate_threshold_bps} bps).")
+    
+    print(f"Low bitrate threshold set to: {effective_bitrate_threshold_bps / 1000:.0f} kbps.")
 
     directory_to_scan = args.directory
     if not directory_to_scan:
@@ -919,16 +946,24 @@ def main():
         print("\nSkipping low bitrate file check.")
         logging.info("Low bitrate check skipped by user.")
     else:
-        response_check_low_br = input(f'\nScan for files with bitrates < {BITRATE_THRESHOLD/1000:.0f}kbps (to quarantine)? (y/n): ').strip().lower()
+        # Use the effective_bitrate_threshold_bps for the prompt
+        prompt_bitrate_kbps = effective_bitrate_threshold_bps / 1000
+        response_check_low_br = input(f'\nScan for files with bitrates < {prompt_bitrate_kbps:.0f}kbps (to quarantine)? (y/n): ').strip().lower()
         response_check_low_br_for_save_logic = response_check_low_br # Store for save condition
+        
         if response_check_low_br == 'y':
             low_bitrate_files_initially_detected = []
-            print(f"\n-- Checking for low bitrate files (using {num_workers} workers)...")
+            print(f"\n-- Checking for files with bitrates lower than {prompt_bitrate_kbps:.0f}kbps (using {num_workers} workers)...")
+            logging.info(f"Starting low bitrate file check (threshold: {effective_bitrate_threshold_bps}bps) using {num_workers} workers.")
             
             files_for_br_check = [f for f in audio_files if os.path.exists(f)]
             with ThreadPoolExecutor(max_workers=num_workers) as executor:
-                future_to_fp_br = { executor.submit(check_bitrate, fp_br): fp_br for fp_br in files_for_br_check }
-                for future in tqdm(future_to_fp_br, desc="Checking bitrates", total=len(future_to_fp_br), unit="file", smoothing=0.1, bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}{postfix}]'):
+                future_to_fp_br = { 
+                    # Pass the effective_bitrate_threshold_bps to check_bitrate
+                    executor.submit(check_bitrate, fp_br, effective_bitrate_threshold_bps): fp_br 
+                    for fp_br in files_for_br_check 
+                }
+                for future in tqdm(future_to_fp_br, desc=f"Checking bitrates (<{prompt_bitrate_kbps:.0f}kbps)", total=len(future_to_fp_br), unit="file", smoothing=0.1, bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}{postfix}]'):
                     filepath_br = future_to_fp_br[future]
                     try:
                         if future.result(): low_bitrate_files_initially_detected.append(filepath_br)
@@ -945,27 +980,26 @@ def main():
                         if not os.path.exists(abs_filepath_lb): continue
                         current_mtime_lb = os.path.getmtime(abs_filepath_lb)
                         current_size_lb = os.path.getsize(abs_filepath_lb)
-                        # Check the current_run_valid_cache_entries, which has up-to-date mtime/size
                         cached_entry_lb = current_run_valid_cache_entries.get(abs_filepath_lb)
                         
                         if cached_entry_lb and \
                            cached_entry_lb.get("mtime") == current_mtime_lb and \
                            cached_entry_lb.get("size") == current_size_lb and \
-                           cached_entry_lb.get("low_bitrate_ignored") is True: # Explicitly check for True
+                           cached_entry_lb.get("low_bitrate_ignored") is True:
                             logging.info(f"Skipping low bitrate prompt for {os.path.basename(abs_filepath_lb)} (previously ignored and unchanged).")
                         else:
                             low_bitrate_files_to_prompt.append(file_path_lb)
-                            # Ensure entry exists and mark as not ignored (will be prompted)
                             entry = current_run_valid_cache_entries.setdefault(abs_filepath_lb, {})
-                            # Ensure mtime/size are current if creating/updating for prompt decision
                             entry["mtime"] = current_mtime_lb 
                             entry["size"] = current_size_lb
                             entry["low_bitrate_ignored"] = False 
                     except OSError as e_lb_stat: logging.warning(f"Could not stat {abs_filepath_lb} for low bitrate ignore check: {e_lb_stat}")
                 
                 if low_bitrate_files_to_prompt:
-                    print(f'\nFound {len(low_bitrate_files_to_prompt)} file(s) needing review for low bitrate.')
+                    print(f'\nFound {len(low_bitrate_files_to_prompt)} file(s) needing review for low bitrate (threshold < {prompt_bitrate_kbps:.0f}kbps).') # Use prompt_bitrate_kbps
                     print(f"Low bitrate files will be quarantined to: {low_br_q_path}")
+                    # ... (y/n/a/q loop for low_bitrate_files_to_prompt as before, it doesn't need the threshold directly) ...
+                    # ... (its summary messages also refer to 'low bitrate' generally)
                     quarantined_lb_count = 0; processed_lb_prompt = 0
                     all_mode_lb = False; quit_mode_lb = False       
                     for i, fp_lb_prompt_path in enumerate(low_bitrate_files_to_prompt):
@@ -973,7 +1007,7 @@ def main():
                         if not os.path.exists(fp_lb_prompt_path): continue
                         processed_lb_prompt += 1
                         should_q_lb = False; abs_fp_lb_prompt = os.path.abspath(fp_lb_prompt_path)
-                        print(f"\n--- File {i+1} of {len(low_bitrate_files_to_prompt)} ---\nLow bitrate candidate: {fp_lb_prompt_path}")
+                        print(f"\n--- File {i+1} of {len(low_bitrate_files_to_prompt)} ---\nLow bitrate candidate (below {prompt_bitrate_kbps:.0f}kbps): {fp_lb_prompt_path}") # Added threshold to prompt
                         
                         if all_mode_lb: should_q_lb = True
                         else:
@@ -981,13 +1015,13 @@ def main():
                             if resp_lb == 'y': 
                                 should_q_lb = True
                                 entry = current_run_valid_cache_entries.setdefault(abs_fp_lb_prompt, {})
-                                entry["low_bitrate_ignored"] = False # Actioned, so not ignored
+                                entry["low_bitrate_ignored"] = False 
                                 try: entry.update({"mtime": os.path.getmtime(abs_fp_lb_prompt), "size": os.path.getsize(abs_fp_lb_prompt)})
                                 except OSError: pass
                             elif resp_lb == 'a': 
                                 should_q_lb = True; all_mode_lb = True
                                 entry = current_run_valid_cache_entries.setdefault(abs_fp_lb_prompt, {})
-                                entry["low_bitrate_ignored"] = False # Actioned, so not ignored
+                                entry["low_bitrate_ignored"] = False 
                                 try: entry.update({"mtime": os.path.getmtime(abs_fp_lb_prompt), "size": os.path.getsize(abs_fp_lb_prompt)})
                                 except OSError: pass
                             elif resp_lb == 'q': 
@@ -1005,9 +1039,7 @@ def main():
                         if should_q_lb:
                             if move_file_to_quarantine(fp_lb_prompt_path, low_br_q_path, args.dry_run):
                                 quarantined_lb_count += 1
-                                # Cache entry for original path will be pruned by os.path.exists before final save
                     
-                    # Summaries for low bitrate
                     if quarantined_lb_count > 0: 
                         print(f"\nLow Bitrate: {'Simulated moving' if args.dry_run else 'Moved'} {quarantined_lb_count} file(s) to '{low_br_q_path}'.")
                         logging.info(f"Low Bitrate: {'Simulated moving' if args.dry_run else 'Moved'} {quarantined_lb_count} file(s) to '{low_br_q_path}'.")
@@ -1019,11 +1051,11 @@ def main():
                         logging.info("Low Bitrate: Quarantine quit by user; no files moved.")
                 else: 
                     if low_bitrate_files_initially_detected : 
-                         print(f"\nAll {len(low_bitrate_files_initially_detected)} potential low bitrate files were previously 'ignored' and unchanged, or no longer exist.")
+                         print(f"\nAll {len(low_bitrate_files_initially_detected)} files identified as low bitrate were previously 'ignored' and unchanged, or no longer exist.")
                          logging.info("All potential low bitrate files were previously 'ignored' and unchanged, or no longer exist.")
             else: 
-                print(f'\nNo files initially identified with bitrates < {BITRATE_THRESHOLD/1000:.0f}kbps.')
-                logging.info(f'No files initially identified with bitrates < {BITRATE_THRESHOLD/1000:.0f}kbps.')
+                print(f'\nNo files initially identified with bitrates < {prompt_bitrate_kbps:.0f}kbps.') # Use prompt_bitrate_kbps
+                logging.info(f'No files initially identified with bitrates < {prompt_bitrate_kbps:.0f}kbps.')
         else: 
             print('\nScan for low bitrate files skipped by user.')
             logging.info("User chose not to scan for low bitrate files.")

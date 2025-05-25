@@ -16,6 +16,7 @@ FINGERPRINT_AUDIO_MAX_LENGTH_SECONDS = 0 # 0 means process the whole file
 CACHE_FILENAME = ".musicscan_fp_cache.json"
 UNSORTED_PATH_MARKER_SEGMENTS = ("Music", "Unsorted") # Segments to identify an "unsorted" path
 MP3VAL_PATH = None
+FFMPEG_PATH = None
 
 # --- Logging Setup ---
 # Placed here so it's configured before any logging calls, even from functions
@@ -63,6 +64,16 @@ def check_mp3val_executable():
         logging.info("mp3val utility not found in PATH. Automatic MP3 repair will be disabled if attempted.")
         return False
     logging.info(f"mp3val utility found at: {MP3VAL_PATH}. Automatic MP3 repair is available if enabled via CLI.")
+    return True
+
+def check_ffmpeg_executable():
+    """Checks if ffmpeg is installed and accessible, sets FFMPEG_PATH global."""
+    global FFMPEG_PATH
+    FFMPEG_PATH = shutil.which("ffmpeg")
+    if not FFMPEG_PATH:
+        logging.info("ffmpeg utility not found in PATH. FFmpeg-based repair will be disabled if attempted.")
+        return False
+    logging.info(f"ffmpeg utility found at: {FFMPEG_PATH}. FFmpeg-based repair is available if enabled via CLI.")
     return True
 
 # --- Cache Functions ---
@@ -191,110 +202,191 @@ def is_in_target_path_pattern(filepath, pattern_segments):
         return False # Default to not matching if an error occurs during path processing
 
 # --- Audio Fingerprinting Function ---
-def get_audio_fingerprint(filepath, attempt_repair_if_needed=False):
+def get_audio_fingerprint(filepath, attempt_repair_mp3val_if_needed=False, attempt_repair_ffmpeg_if_needed=False):
     """
     Calculates the audio fingerprint and duration of a file.
-    Optionally attempts to repair MP3s with mp3val if fingerprinting fails and repair is enabled.
-    Manages a temporary backup during repair attempts.
+    Optionally attempts to repair MP3s with mp3val, and then with FFmpeg if fingerprinting fails and repair is enabled.
+    Manages temporary backups during repair attempts.
     """
     try:
         # Initial fingerprint attempt
         duration, fp_bytes = acoustid.fingerprint_file(filepath, maxlength=FINGERPRINT_AUDIO_MAX_LENGTH_SECONDS)
-        logging.debug(f"Successfully fingerprinted: {os.path.basename(filepath)}, Duration: {duration:.2f}s")
+        logging.debug(f"Successfully fingerprinted (initial attempt): {os.path.basename(filepath)}, Duration: {duration:.2f}s")
         return duration, fp_bytes
     except acoustid.FingerprintGenerationError as e_initial_fp:
         logging.warning(f"Initial fingerprint generation failed for {filepath}: {e_initial_fp}")
+        original_error_for_ffmpeg_check = str(e_initial_fp).lower() # Store initial error for ffmpeg condition
 
-        # Check if we should attempt repair based on error type, file type, and user flag
-        should_try_repair = (
-            attempt_repair_if_needed and
-            MP3VAL_PATH and # Check if mp3val path is known (set by check_mp3val_executable)
+        # --- STAGE 1: mp3val Repair Attempt (if enabled and applicable) ---
+        should_try_mp3val = (
+            attempt_repair_mp3val_if_needed and
+            MP3VAL_PATH and
             filepath.lower().endswith(".mp3") and
-            ("fpcalc exited with status" in str(e_initial_fp).lower() or \
-             "error decoding" in str(e_initial_fp).lower() or \
-             "header missing" in str(e_initial_fp).lower()) # Common indicators for mp3 issues
+            ("fpcalc exited with status" in original_error_for_ffmpeg_check or \
+             "error decoding" in original_error_for_ffmpeg_check or \
+             "header missing" in original_error_for_ffmpeg_check)
         )
 
-        if should_try_repair:
+        if should_try_mp3val:
             logging.info(f"Attempting to repair {os.path.basename(filepath)} with mp3val...")
             print(f"INFO: Fingerprint failed for {os.path.basename(filepath)}, attempting repair with mp3val...")
             
-            backup_filepath = filepath + ".musicscan_repair.bak"
-            original_file_backed_up = False
-            repair_led_to_successful_fp = False
+            backup_filepath_mp3val = filepath + ".musicscan_mp3val_repair.bak"
+            original_file_backed_up_mp3val = False
+            mp3val_repair_led_to_fp = False
 
             try:
-                # 1. Create our script's backup of the original file
-                shutil.copy2(filepath, backup_filepath)
-                original_file_backed_up = True
-                logging.info(f"Backup of {filepath} created at {backup_filepath}")
+                shutil.copy2(filepath, backup_filepath_mp3val)
+                original_file_backed_up_mp3val = True
+                logging.info(f"Backup for mp3val of {filepath} created at {backup_filepath_mp3val}")
 
-                # 2. Run mp3val to fix in-place.
-                #    -f: find & fix problems
-                #    -nb: do not create mp3val's own .bak file (we manage our own)
-                #    -si: silent info (less console noise from mp3val itself)
                 mp3val_cmd = [MP3VAL_PATH, "-f", "-nb", "-si", filepath]
                 process = subprocess.run(mp3val_cmd, capture_output=True, text=True, check=False, encoding='utf-8', errors='replace')
                 
-                log_mp3val_output = process.stdout.strip() if process.stdout else ""
-                if process.stderr: log_mp3val_output += (f"\nStderr: {process.stderr.strip()}")
-                logging.debug(f"mp3val output for {filepath} (Return Code: {process.returncode}):\n{log_mp3val_output}")
+                # Log mp3val output
+                log_mp3val_out = process.stdout.strip() if process.stdout else ""
+                if process.stderr: log_mp3val_out += (f"\nStderr: {process.stderr.strip()}")
+                logging.debug(f"mp3val output for {filepath} (RC: {process.returncode}):\n{log_mp3val_out}")
 
-                # Check if mp3val indicated it did something or exited cleanly.
-                if process.returncode == 0: 
+                if process.returncode == 0: # mp3val ran without crashing
                     if "FIXED" in (process.stdout.upper() if process.stdout else ""):
                         logging.info(f"mp3val reported fixing errors for {filepath}.")
                         print(f"INFO: mp3val reported fixing errors for {os.path.basename(filepath)}.")
                     else:
                         logging.info(f"mp3val processed {filepath}. Retrying fingerprint.")
                         print(f"INFO: mp3val processed {os.path.basename(filepath)}. Retrying fingerprint.")
-
-                    # 3. Try fingerprinting again on the (potentially) repaired file
-                    logging.info(f"Retrying fingerprinting for file: {filepath}")
-                    try:
+                    
+                    try: # Retry fingerprinting
                         duration_rep, fp_bytes_rep = acoustid.fingerprint_file(filepath, maxlength=FINGERPRINT_AUDIO_MAX_LENGTH_SECONDS)
                         logging.info(f"Successfully fingerprinted file after mp3val attempt: {filepath}")
                         print(f"INFO: Successfully fingerprinted file after mp3val attempt: {os.path.basename(filepath)}.")
-                        repair_led_to_successful_fp = True 
-                        return duration_rep, fp_bytes_rep
-                    except acoustid.FingerprintGenerationError as e_after_repair:
-                        logging.warning(f"Fingerprinting STILL FAILED for {filepath} after mp3val repair attempt: {e_after_repair}")
-                    except Exception as e_fp_retry:
-                        logging.error(f"Unexpected error during re-fingerprinting of {filepath} after mp3val: {e_fp_retry}")
-                else: # mp3val exited with an error
+                        mp3val_repair_led_to_fp = True
+                        return duration_rep, fp_bytes_rep # SUCCESS after mp3val
+                    except acoustid.FingerprintGenerationError as e_after_mp3val:
+                        logging.warning(f"Fingerprinting STILL FAILED for {filepath} after mp3val attempt: {e_after_mp3val}")
+                    except Exception as e_fp_mp3val_retry:
+                        logging.error(f"Unexpected error re-fingerprinting {filepath} after mp3val: {e_fp_mp3val_retry}")
+                else:
                     logging.warning(f"mp3val failed for {filepath} with exit code {process.returncode}.")
-                    print(f"WARNING: mp3val repair attempt failed for {os.path.basename(filepath)} (exit code: {process.returncode}).")
+                    print(f"WARNING: mp3val repair attempt failed for {os.path.basename(filepath)} (code: {process.returncode}).")
             
-            except FileNotFoundError: 
-                logging.error(f"mp3val command not found at {MP3VAL_PATH} during repair. Ensure it's installed and in PATH.")
+            except FileNotFoundError:
+                logging.error(f"mp3val command not found at {MP3VAL_PATH}. Cannot attempt mp3val repair.")
                 print(f"ERROR: mp3val not found at {MP3VAL_PATH}. Cannot attempt repair for {os.path.basename(filepath)}.")
-            except Exception as repair_exception: 
-                logging.error(f"An error occurred during the mp3val repair process for {filepath}: {repair_exception}")
+            except Exception as repair_exception_mp3val:
+                logging.error(f"An error occurred during the mp3val repair process for {filepath}: {repair_exception_mp3val}")
             finally:
-                if original_file_backed_up:
-                    if repair_led_to_successful_fp:
+                if original_file_backed_up_mp3val:
+                    if mp3val_repair_led_to_fp: # Success, remove our backup
+                        try: os.remove(backup_filepath_mp3val)
+                        except OSError as e_rm_bak: logging.warning(f"Could not remove mp3val backup {backup_filepath_mp3val}: {e_rm_bak}")
+                    else: # mp3val path failed, restore original file from our backup
                         try:
-                            os.remove(backup_filepath)
-                            logging.info(f"Removed script's backup {backup_filepath} after successful repair and fingerprinting.")
-                        except OSError as e_rm_bak:
-                            logging.warning(f"Could not remove script's backup {backup_filepath}: {e_rm_bak}")
-                    else: # Repair not successful or re-fingerprinting failed; restore original
-                        try:
-                            if os.path.exists(backup_filepath): # Check if backup still exists
-                                shutil.move(backup_filepath, filepath) 
-                                logging.info(f"Restored original file {filepath} from script's backup due to unsuccessful mp3val/fingerprinting.")
-                                print(f"INFO: Original file {os.path.basename(filepath)} restored as repair did not lead to successful fingerprinting.")
-                            else:
-                                logging.warning(f"Backup file {backup_filepath} not found for restoration. Original file might be in mp3val-modified state.")
-                        except Exception as restore_e:
-                            logging.error(f"CRITICAL: Failed to restore {filepath} from {backup_filepath} after repair attempt: {restore_e}")
-                            print(f"ERROR: Failed to restore original file {os.path.basename(filepath)} from backup. Backup is at: {backup_filepath}")
+                            if os.path.exists(backup_filepath_mp3val):
+                                shutil.move(backup_filepath_mp3val, filepath)
+                                logging.info(f"Restored original {filepath} from mp3val backup as repair didn't lead to successful FP.")
+                            # else: backup was already moved or deleted, problem
+                        except Exception as e_restore_mp3val:
+                            logging.error(f"CRITICAL: Failed to restore {filepath} from mp3val backup {backup_filepath_mp3val}: {e_restore_mp3val}")
+                            print(f"ERROR: Failed to restore original {os.path.basename(filepath)} from mp3val backup. Backup: {backup_filepath_mp3val}")
+            
+            if mp3val_repair_led_to_fp: # Should have already returned if successful
+                 return None, None # Should ideally not be reached if logic above is perfect
+
+        # --- STAGE 2: FFmpeg Repair Attempt ---
+        # This runs if:
+        # 1. Initial fingerprinting failed (e_initial_fp is defined).
+        # 2. EITHER mp3val repair was not attempted (e.g., not enabled, not MP3, MP3VAL_PATH not set).
+        # 3. OR mp3val repair was attempted but did not result in a successful return of fingerprint (mp3val_repair_led_to_fp is False).
+        #    (The file at 'filepath' should be in its pre-mp3val state if mp3val's 'finally' block worked correctly on failure).
+        
+        should_try_ffmpeg = (
+            attempt_repair_ffmpeg_if_needed and
+            FFMPEG_PATH and # Check if ffmpeg path is known
+            ("fpcalc exited with status" in original_error_for_ffmpeg_check or \
+             "error decoding" in original_error_for_ffmpeg_check or \
+             "header missing" in original_error_for_ffmpeg_check) # Use similar error triggers
+        )
+
+        if should_try_ffmpeg:
+            logging.info(f"Attempting to repair {os.path.basename(filepath)} with FFmpeg re-encode...")
+            print(f"INFO: mp3val repair failed/skipped for {os.path.basename(filepath)}, attempting FFmpeg re-encode (POTENTIAL QUALITY LOSS)...")
+
+            backup_filepath_ffmpeg = filepath + ".musicscan_ffmpeg_repair.bak"
+            # Use a distinct temp name to avoid collision if original had ".ffmpeg_repaired_temp"
+            temp_output_filename = os.path.basename(filepath) + ".ffmpeg_temp_out" + os.path.splitext(filepath)[1]
+            temp_output_filepath = os.path.join(os.path.dirname(filepath), temp_output_filename)
+
+            original_file_backed_up_ffmpeg = False
+            ffmpeg_repair_led_to_fp = False
+
+            try:
+                shutil.copy2(filepath, backup_filepath_ffmpeg)
+                original_file_backed_up_ffmpeg = True
+                logging.info(f"Backup for FFmpeg of {filepath} created at {backup_filepath_ffmpeg}")
+
+                # For MP3s, re-encode to MP3. For other (potentially lossless) formats, try -c:a copy first.
+                # This is a simplified approach; more format-specific handling might be better.
+                if filepath.lower().endswith(".mp3"):
+                    ffmpeg_cmd = [FFMPEG_PATH, "-y", "-i", filepath, "-codec:a", "libmp3lame", "-qscale:a", "2", "-loglevel", "error", temp_output_filepath]
+                    logging.debug("Using FFmpeg re-encode for MP3.")
+                else: # For FLAC, WAV etc., first try a stream copy (remux)
+                    ffmpeg_cmd = [FFMPEG_PATH, "-y", "-i", filepath, "-codec:a", "copy", "-loglevel", "error", temp_output_filepath]
+                    logging.debug(f"Using FFmpeg stream copy for non-MP3: {os.path.basename(filepath)}")
                 
-        # If repair was not attempted, or if it was attempted and failed to yield a good fingerprint
+                process_ffmpeg = subprocess.run(ffmpeg_cmd, capture_output=True, text=True, check=False, encoding='utf-8', errors='replace')
+
+                if process_ffmpeg.returncode == 0 and os.path.exists(temp_output_filepath) and os.path.getsize(temp_output_filepath) > 0:
+                    logging.info(f"FFmpeg processing to {temp_output_filepath} successful for {filepath}.")
+                    # Replace original with the re-encoded/remuxed temporary file
+                    shutil.move(temp_output_filepath, filepath) # Original filepath is now the processed one
+                    logging.info(f"Replaced {filepath} with FFmpeg processed version.")
+                    print(f"INFO: FFmpeg processing seemed successful for {os.path.basename(filepath)}. Retrying fingerprint.")
+
+                    try: # Retry fingerprinting
+                        duration_ffmpeg_rep, fp_bytes_ffmpeg_rep = acoustid.fingerprint_file(filepath, maxlength=FINGERPRINT_AUDIO_MAX_LENGTH_SECONDS)
+                        logging.info(f"Successfully fingerprinted after FFmpeg processing: {filepath}")
+                        print(f"INFO: Successfully fingerprinted after FFmpeg processing: {os.path.basename(filepath)}.")
+                        ffmpeg_repair_led_to_fp = True
+                        return duration_ffmpeg_rep, fp_bytes_ffmpeg_rep # SUCCESS after FFmpeg
+                    except acoustid.FingerprintGenerationError as e_after_ffmpeg:
+                        logging.warning(f"Fingerprinting STILL FAILED for {filepath} after FFmpeg processing: {e_after_ffmpeg}")
+                    except Exception as e_fp_ffmpeg_retry:
+                        logging.error(f"Unexpected error re-fingerprinting {filepath} after FFmpeg: {e_fp_ffmpeg_retry}")
+                else: # FFmpeg command failed or produced empty file
+                    logging.warning(f"FFmpeg processing failed for {filepath} or produced empty file. RC: {process_ffmpeg.returncode}. Stderr: {process_ffmpeg.stderr.strip() if process_ffmpeg.stderr else 'N/A'}")
+                    print(f"WARNING: FFmpeg processing failed for {os.path.basename(filepath)}.")
+            
+            except FileNotFoundError:
+                logging.error(f"ffmpeg command not found at {FFMPEG_PATH}. Cannot attempt FFmpeg repair.")
+                print(f"ERROR: ffmpeg not found at {FFMPEG_PATH}. Cannot attempt repair for {os.path.basename(filepath)}.")
+            except Exception as ffmpeg_repair_exception:
+                logging.error(f"An error occurred during the FFmpeg repair process for {filepath}: {ffmpeg_repair_exception}")
+            finally:
+                if os.path.exists(temp_output_filepath): # Clean up temp output if it still exists
+                    try: os.remove(temp_output_filepath)
+                    except OSError: pass
+                if original_file_backed_up_ffmpeg:
+                    if ffmpeg_repair_led_to_fp: # Success, remove our backup
+                        try: os.remove(backup_filepath_ffmpeg)
+                        except OSError as e: logging.warning(f"Could not remove FFmpeg backup {backup_filepath_ffmpeg}: {e}")
+                    else: # FFmpeg path failed, restore original file from our backup
+                        try:
+                            if os.path.exists(backup_filepath_ffmpeg):
+                                shutil.move(backup_filepath_ffmpeg, filepath)
+                                logging.info(f"Restored {filepath} from FFmpeg backup as repair didn't lead to successful FP.")
+                                print(f"INFO: Original file {os.path.basename(filepath)} restored as FFmpeg repair did not lead to successful fingerprinting.")
+                            # else: backup was already moved or deleted, problem
+                        except Exception as e_restore_ff:
+                            logging.error(f"CRITICAL: Failed to restore {filepath} from FFmpeg backup {backup_filepath_ffmpeg}: {e_restore_ff}")
+                            print(f"ERROR: Failed to restore original from FFmpeg backup. Backup: {backup_filepath_ffmpeg}")
+        
+        # If all repair attempts failed or were not applicable/enabled from the initial FingerprintGenerationError
         return None, None 
 
-    except Exception as general_e: 
-        logging.error(f"Unexpected error during initial fingerprinting of {filepath}: {general_e}")
+    except Exception as general_initial_e: 
+        # Catch other potential errors during the very first fingerprinting attempt (e.g., file not found if path is bad before any repair attempt)
+        logging.error(f"Unexpected error during initial fingerprinting of {filepath} (before any repair logic): {general_initial_e}")
         return None, None
 
 def prompt_to_remove_duplicates(duplicates, quarantine_path, dry_run=False): # Added quarantine_path
@@ -583,6 +675,15 @@ def main():
              're-fingerprinting succeed, otherwise the original is restored from it. \n'
              'Use with extreme caution and ensure your library is backed up. Requires mp3val in PATH.'
     )
+    parser.add_argument(
+        '--auto-repair-ffmpeg',
+        action='store_true',
+        help='EXPERIMENTAL: If mp3val repair fails or is not applicable/enabled, attempt to repair files \n'
+             'that fail fingerprinting by re-encoding them with FFmpeg. \n'
+             'NOTE: This is often a LOSSY process for formats like MP3 and may reduce audio quality. \n'
+             'A temporary backup of the original file will be made by this script before repair. \n'
+             'Use with EXTREME CAUTION. Requires FFmpeg in PATH.'
+    )
     args = parser.parse_args()
 
     if args.dry_run:
@@ -630,15 +731,24 @@ def main():
     # Check for external executables
     can_fingerprint_system_ok = check_fpcalc_executable()
     can_repair_mp3_system_ok = check_mp3val_executable() # Check for mp3val
+    can_repair_ffmpeg_system_ok = check_ffmpeg_executable() # Check for ffmpeg
 
     # Determine if repair should be attempted based on CLI flag and mp3val availability
     attempt_mp3_repair_globally = args.auto_repair_mp3 and can_repair_mp3_system_ok
     if args.auto_repair_mp3 and not can_repair_mp3_system_ok:
         print("WARNING: MP3 auto-repair was requested (--auto-repair-mp3), but mp3val utility was not found in PATH. Repair feature will be disabled.")
         logging.warning("MP3 auto-repair disabled because mp3val was not found in PATH.")
-    elif args.auto_repair_mp3: # This means it's enabled AND mp3val is available
+    elif args.auto_repair_mp3:
         print("INFO: MP3 auto-repair enabled. Problematic MP3s will be backed up and repair will be attempted with mp3val.")
         logging.info("MP3 auto-repair enabled by user and mp3val found.")
+
+    attempt_ffmpeg_repair_globally = args.auto_repair_ffmpeg and can_repair_ffmpeg_system_ok
+    if args.auto_repair_ffmpeg and not can_repair_ffmpeg_system_ok:
+        print("WARNING: FFmpeg auto-repair requested, but ffmpeg not found. Will be disabled.")
+        logging.warning("FFmpeg auto-repair disabled: ffmpeg not found.")
+    elif args.auto_repair_ffmpeg:
+        print("INFO: FFmpeg auto-repair enabled (used if mp3val fails/skipped and if applicable). This may be LOSSY.")
+        logging.info("FFmpeg auto-repair enabled by user.")
 
     # --- Initial File Scan (excluding quarantine) ---
     print(f"Scanning for audio files in: {directory_to_scan} (excluding quarantine path: {effective_quarantine_path})...")
@@ -731,9 +841,16 @@ def main():
         
         if files_needing_fingerprinting:
             print(f"\n-- Generating {len(files_needing_fingerprinting)} audio fingerprints (using {num_workers} workers)...")
+            logging.info(f"Generating {len(files_needing_fingerprinting)} new/updated audio fingerprints using {num_workers} workers. mp3val repair: {attempt_mp3_repair_globally}, ffmpeg repair: {attempt_ffmpeg_repair_globally}")
+            
             with ThreadPoolExecutor(max_workers=num_workers) as executor:
                 future_to_filepath = { 
-                    executor.submit(get_audio_fingerprint, fp_path, attempt_mp3_repair_globally): fp_path 
+                    executor.submit(
+                        get_audio_fingerprint, 
+                        fp_path, # This should be the path string
+                        attempt_mp3_repair_globally, 
+                        attempt_ffmpeg_repair_globally 
+                    ): fp_path 
                     for fp_path in files_needing_fingerprinting 
                 }
                 for future in tqdm(future_to_filepath, desc="Fingerprinting files", total=len(future_to_filepath), unit="file", smoothing=0.1, bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}{postfix}]'):
@@ -755,14 +872,21 @@ def main():
                                 "mtime": current_mtime_fp, 
                                 "size": current_size_fp
                             })
-                            entry.pop("low_bitrate_ignored", None) # Reset ignore flag on re-fingerprint
+                            # If successfully fingerprinted (even after repair), reset ignore flag,
+                            # as content might have changed enough or it's a fresh FP.
+                            entry.pop("low_bitrate_ignored", None) 
                     except OSError as e: # Catch if getmtime/getsize fails (e.g. file gone after repair attempt)
                         logging.error(f"OSError accessing {abs_filepath_processed} after fingerprint attempt: {e}")
                     except Exception as e: 
                         logging.error(f"Error processing fingerprint result for {abs_filepath_processed}: {e}")
-        elif not args.force_re_fingerprint: 
+        elif not args.force_re_fingerprint and (not args.skip_duplicates and can_fingerprint_system_ok) : 
+            # Only print this if fingerprinting was supposed to run but no files needed it
             print("\n-- No new files needed fingerprinting based on cache status.")
+            logging.info("No new files needed fingerprinting based on cache status.")
         
+        # --- Duplicate Identification (from fingerprint_map) ---
+        # This part runs if duplicate detection was not skipped and fpcalc is available
+        logging.info("Fingerprint processing complete. Identifying duplicates from map.")
         print("\n-- Identifying duplicates from fingerprints...")
         for (fp_bytes, duration_group), files_list in tqdm(fingerprint_map.items(), desc="Processing fingerprints", unit="group", smoothing=0.1, bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}{postfix}]'):
             if len(files_list) > 1:
@@ -785,6 +909,12 @@ def main():
             logging.info('No duplicates found.')
 
     # --- Low Bitrate File Check ---
+    # This 'response_check_low_br_for_save_logic' should have been defined before this block starts.
+    # If skip_low_bitrate is True, it remains "n". Otherwise, it's set by user input.
+    # Initialize it here if it might not be set due to skip_duplicates path.
+    if 'response_check_low_br_for_save_logic' not in locals():
+        response_check_low_br_for_save_logic = "n" 
+
     if args.skip_low_bitrate:
         print("\nSkipping low bitrate file check.")
         logging.info("Low bitrate check skipped by user.")
@@ -815,18 +945,20 @@ def main():
                         if not os.path.exists(abs_filepath_lb): continue
                         current_mtime_lb = os.path.getmtime(abs_filepath_lb)
                         current_size_lb = os.path.getsize(abs_filepath_lb)
+                        # Check the current_run_valid_cache_entries, which has up-to-date mtime/size
                         cached_entry_lb = current_run_valid_cache_entries.get(abs_filepath_lb)
                         
                         if cached_entry_lb and \
                            cached_entry_lb.get("mtime") == current_mtime_lb and \
                            cached_entry_lb.get("size") == current_size_lb and \
-                           cached_entry_lb.get("low_bitrate_ignored") is True:
+                           cached_entry_lb.get("low_bitrate_ignored") is True: # Explicitly check for True
                             logging.info(f"Skipping low bitrate prompt for {os.path.basename(abs_filepath_lb)} (previously ignored and unchanged).")
                         else:
                             low_bitrate_files_to_prompt.append(file_path_lb)
                             # Ensure entry exists and mark as not ignored (will be prompted)
                             entry = current_run_valid_cache_entries.setdefault(abs_filepath_lb, {})
-                            entry["mtime"] = current_mtime_lb # Ensure mtime/size are current if creating/updating
+                            # Ensure mtime/size are current if creating/updating for prompt decision
+                            entry["mtime"] = current_mtime_lb 
                             entry["size"] = current_size_lb
                             entry["low_bitrate_ignored"] = False 
                     except OSError as e_lb_stat: logging.warning(f"Could not stat {abs_filepath_lb} for low bitrate ignore check: {e_lb_stat}")
@@ -846,9 +978,20 @@ def main():
                         if all_mode_lb: should_q_lb = True
                         else:
                             resp_lb = input(f"Move to '{os.path.basename(low_br_q_path)}' quarantine? (y/n/a/q): ").strip().lower()
-                            if resp_lb == 'y': should_q_lb = True
-                            elif resp_lb == 'a': should_q_lb = True; all_mode_lb = True
-                            elif resp_lb == 'q': quit_mode_lb = True; print("Quitting low bitrate quarantine."); break
+                            if resp_lb == 'y': 
+                                should_q_lb = True
+                                entry = current_run_valid_cache_entries.setdefault(abs_fp_lb_prompt, {})
+                                entry["low_bitrate_ignored"] = False # Actioned, so not ignored
+                                try: entry.update({"mtime": os.path.getmtime(abs_fp_lb_prompt), "size": os.path.getsize(abs_fp_lb_prompt)})
+                                except OSError: pass
+                            elif resp_lb == 'a': 
+                                should_q_lb = True; all_mode_lb = True
+                                entry = current_run_valid_cache_entries.setdefault(abs_fp_lb_prompt, {})
+                                entry["low_bitrate_ignored"] = False # Actioned, so not ignored
+                                try: entry.update({"mtime": os.path.getmtime(abs_fp_lb_prompt), "size": os.path.getsize(abs_fp_lb_prompt)})
+                                except OSError: pass
+                            elif resp_lb == 'q': 
+                                quit_mode_lb = True; print("Quitting low bitrate quarantine."); break
                             elif resp_lb == 'n':
                                 print(f"Skipped (will be ignored next time if unchanged): {fp_lb_prompt_path}")
                                 entry = current_run_valid_cache_entries.setdefault(abs_fp_lb_prompt, {})
@@ -862,50 +1005,92 @@ def main():
                         if should_q_lb:
                             if move_file_to_quarantine(fp_lb_prompt_path, low_br_q_path, args.dry_run):
                                 quarantined_lb_count += 1
-                            entry = current_run_valid_cache_entries.setdefault(abs_fp_lb_prompt, {})
-                            entry["low_bitrate_ignored"] = False 
-                            try: # Update mtime/size for the record before (potential) move
-                                entry["mtime"] = os.path.getmtime(abs_fp_lb_prompt) 
-                                entry["size"] = os.path.getsize(abs_fp_lb_prompt)
-                            except OSError: pass 
+                                # Cache entry for original path will be pruned by os.path.exists before final save
                     
-                    if quarantined_lb_count > 0: print(f"\nLow Bitrate: {'Simulated moving' if args.dry_run else 'Moved'} {quarantined_lb_count} file(s) to '{low_br_q_path}'.")
-                    elif processed_lb_prompt > 0 and not quit_mode_lb: print("\nLow Bitrate: No files moved to quarantine by choice.")
-                    elif quit_mode_lb and quarantined_lb_count == 0: print("\nLow Bitrate: Quarantine quit; no files moved.")
+                    # Summaries for low bitrate
+                    if quarantined_lb_count > 0: 
+                        print(f"\nLow Bitrate: {'Simulated moving' if args.dry_run else 'Moved'} {quarantined_lb_count} file(s) to '{low_br_q_path}'.")
+                        logging.info(f"Low Bitrate: {'Simulated moving' if args.dry_run else 'Moved'} {quarantined_lb_count} file(s) to '{low_br_q_path}'.")
+                    elif processed_lb_prompt > 0 and not quit_mode_lb: 
+                        print("\nLow Bitrate: No files moved to quarantine by choice.")
+                        logging.info("Low Bitrate: No files moved to quarantine by choice.")
+                    elif quit_mode_lb and quarantined_lb_count == 0: 
+                        print("\nLow Bitrate: Quarantine quit by user; no files moved.")
+                        logging.info("Low Bitrate: Quarantine quit by user; no files moved.")
                 else: 
-                    if low_bitrate_files_initially_detected : # Only print if some were detected but all were filtered by cache
-                        print(f"\nAll {len(low_bitrate_files_initially_detected)} potential low bitrate files were previously 'ignored' and unchanged, or no longer exist.")
-            else: print(f'\nNo files initially identified with bitrates < {BITRATE_THRESHOLD/1000:.0f}kbps.')
-        else: print('\nScan for low bitrate files skipped by user.')
+                    if low_bitrate_files_initially_detected : 
+                         print(f"\nAll {len(low_bitrate_files_initially_detected)} potential low bitrate files were previously 'ignored' and unchanged, or no longer exist.")
+                         logging.info("All potential low bitrate files were previously 'ignored' and unchanged, or no longer exist.")
+            else: 
+                print(f'\nNo files initially identified with bitrates < {BITRATE_THRESHOLD/1000:.0f}kbps.')
+                logging.info(f'No files initially identified with bitrates < {BITRATE_THRESHOLD/1000:.0f}kbps.')
+        else: 
+            print('\nScan for low bitrate files skipped by user.')
+            logging.info("User chose not to scan for low bitrate files.")
 
-    # --- Rename files ---
+    # --- Rename files based on metadata (conditionally) ---
     if args.rename_metadata:
         print("\n-- Renaming files based on metadata --")
-        files_to_rename = [f for f in audio_files if os.path.exists(f)]
-        if not files_to_rename: print("No audio files remaining for renaming.")
+        logging.info("Starting metadata-based renaming process.")
+        # Use a fresh list of existing audio files for renaming, as some might have been quarantined
+        files_to_rename_after_ops = [f for f in audio_files if os.path.exists(f)] # Check original audio_files list
+        
+        if not files_to_rename_after_ops:
+            print("No audio files remaining to consider for renaming.")
+            logging.info("No audio files remaining for renaming after prior operations.")
         else:
-            print(f"Checking {len(files_to_rename)} audio file(s) for renaming...")
+            print(f"Checking {len(files_to_rename_after_ops)} audio file(s) for renaming...")
             renamed_c = 0
-            for fp_rename in tqdm(files_to_rename, desc="Renaming files", unit="file", smoothing=0.1, bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}{postfix}]'):
-                if rename_files_from_metadata(fp_rename, args.dry_run): renamed_c += 1
-            if renamed_c > 0: print(f"Successfully {'simulated renaming of' if args.dry_run else 'renamed'} {renamed_c} file(s).")
-            elif args.dry_run and len(files_to_rename) > 0: print("Dry run: No files were actually renamed.")
-            else: print("No files were renamed based on metadata.")
-    else: print("\nSkipping renaming files based on metadata.")
+            for fp_rename in tqdm(files_to_rename_after_ops, desc="Renaming files", unit="file", smoothing=0.1, bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}{postfix}]'):
+                if rename_files_from_metadata(fp_rename, args.dry_run): 
+                    renamed_c += 1
+            
+            if renamed_c > 0: 
+                summary_msg = f"Successfully {'simulated renaming of' if args.dry_run else 'renamed'} {renamed_c} file(s) based on metadata."
+                print(summary_msg); logging.info(summary_msg)
+            elif args.dry_run and len(files_to_rename_after_ops) > 0 : 
+                print("Dry run: No files were actually renamed."); logging.info("Dry run: No files were actually renamed.")
+            elif len(files_to_rename_after_ops) > 0 : # Files were checked but none needed renaming
+                print("No files needed renaming based on metadata (or errors occurred).")
+                logging.info("No files needed renaming based on metadata (or errors occurred).")
+    else:
+        print("\nSkipping renaming files based on metadata.")
+        logging.info("Renaming based on metadata disabled.")
 
     # --- FINAL CACHE SAVE ---
-    final_cache_to_save = { 
-        fp_abs_save: data_save 
-        for fp_abs_save, data_save in current_run_valid_cache_entries.items() 
-        if os.path.exists(fp_abs_save) # Only save entries for files that still exist at their original path
-    }
+    # Prune entries from current_run_valid_cache_entries for files that no longer exist (e.g. were quarantined)
+    # or for which we couldn't get mtime/size (e.g. if they vanished during script run).
+    final_cache_to_save = {}
+    logging.info(f"Preparing final cache. Starting with {len(current_run_valid_cache_entries)} working entries.")
+    for fp_abs_save, data_save in current_run_valid_cache_entries.items():
+        if os.path.exists(fp_abs_save): # Only save cache entries for files that still exist at their original path
+            # Ensure mtime and size are present if we are saving this entry, 
+            # especially if it only has an ignore flag from an old cache and fingerprinting was skipped.
+            if "mtime" not in data_save or "size" not in data_save: # Should be rare given pre-population
+                try:
+                    data_save["mtime"] = os.path.getmtime(fp_abs_save)
+                    data_save["size"] = os.path.getsize(fp_abs_save)
+                    final_cache_to_save[fp_abs_save] = data_save
+                except OSError as e_stat_save:
+                    logging.warning(f"Could not stat existing file {fp_abs_save} before saving its cache entry: {e_stat_save}. Entry skipped.")
+            else: # mtime and size are already there
+                 final_cache_to_save[fp_abs_save] = data_save
+        else:
+            logging.info(f"Pruning cache entry for non-existent file (e.g., quarantined or deleted): {fp_abs_save}")
     
-    # Determine if any cache-relevant operation was attempted
-    did_fingerprint_stage_run = not args.skip_duplicates and can_fingerprint_system_ok
-    did_low_bitrate_scan_run = not args.skip_low_bitrate and response_check_low_br_for_save_logic.lower() == 'y'
+    # Determine if any cache-relevant operation was actually attempted by the user or forced
+    did_fingerprint_stage_run_attempted = not args.skip_duplicates and can_fingerprint_system_ok
+    did_low_bitrate_scan_run_attempted = not args.skip_low_bitrate and response_check_low_br_for_save_logic.lower() == 'y'
 
-    if args.force_re_fingerprint or did_fingerprint_stage_run or did_low_bitrate_scan_run :
-        save_fingerprint_cache(cache_file_path, final_cache_to_save)
+    if args.force_re_fingerprint or did_fingerprint_stage_run_attempted or did_low_bitrate_scan_run_attempted:
+        if final_cache_to_save: # Only save if there's something to save
+            save_fingerprint_cache(cache_file_path, final_cache_to_save)
+        else:
+            logging.info("Final cache to save is empty (e.g., all files removed or no valid entries). Not writing empty cache file.")
+            # Optionally, delete the cache file if it's now empty:
+            # if os.path.exists(cache_file_path):
+            #     try: os.remove(cache_file_path); logging.info(f"Removed empty cache file: {cache_file_path}")
+            #     except OSError as e: logging.error(f"Could not remove empty cache file {cache_file_path}: {e}")
     else:
         logging.info("Skipping final cache save as no cache-relevant operations were performed or enabled this session.")
 
